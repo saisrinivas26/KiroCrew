@@ -65,6 +65,7 @@ from . import (
     inline_payload,
     paths,
     perm_verb_mention,
+    push_verdict,
     redaction,
     shell_normalizer,
     vocabulary,
@@ -1104,12 +1105,53 @@ def _inline_interpreter_bindings(text: str) -> str:
     return _INTERP_IDENT_RE.sub(lambda m: bindings.get(m.group(0), m.group(0)), text)
 
 
+@dataclass(frozen=True)
+class PushVerdictActivation:
+    """A push-verdict activation reading RESOLVED once, so ``is_denied`` need not read the
+    keystone itself.
+
+    ``is_denied`` reads the activation keystone (an ``open`` + JSON parse under the crew data
+    home) only on a git-publish command, but that read is synchronous and ``is_denied`` runs on
+    the gateway event loop for every async gate caller -- so on a slow network-mounted data home
+    it can stall the loop and its heartbeat. An async caller resolves this OFF the loop with
+    :func:`resolve_push_verdict_activation` and passes it into ``is_denied(..., activation=)``;
+    the three states the inline read produced are preserved exactly:
+
+    * ``enabled=True``  -> gating is on (the keystone's ``enabled`` is literally true);
+    * ``enabled=False`` + ``unreadable_detail=None`` -> gating is off / never activated;
+    * ``unreadable_detail`` set -> the keystone exists but could not be read/parsed, which
+      ``is_denied`` turns into the SAME fail-closed ``git-publish-activation-unreadable`` refusal
+      the inline ``ActivationUnreadable`` path produces.
+    """
+
+    enabled: bool
+    unreadable_detail: str | None = None
+
+
+def resolve_push_verdict_activation() -> PushVerdictActivation:
+    """Read the push-verdict activation keystone and fold it into a :class:`PushVerdictActivation`.
+
+    Call this from a worker thread (``asyncio.to_thread``) in an async gate caller, then pass the
+    result into ``is_denied(..., activation=...)`` so the synchronous ``is_denied`` performs no
+    keystone read on the event loop. The unreadable case is captured rather than raised, so the
+    caller does not have to handle ``ActivationUnreadable`` -- ``is_denied`` reproduces the
+    fail-closed refusal from the captured detail.
+    """
+    push_verdict = _submodule("push_verdict")
+    try:
+        return PushVerdictActivation(enabled=push_verdict.activation_enabled())
+    except push_verdict.ActivationUnreadable as exc:
+        return PushVerdictActivation(enabled=False, unreadable_detail=str(exc))
+
+
 def is_denied(
     tool_name: str,
     extra_patterns: list[str] | None = None,
     *,
     denied_regexes: list[str] | None = None,
     reason_notes: dict[str, str] | None = None,
+    session_key: str = "",
+    activation: "PushVerdictActivation | None" = None,
 ) -> str | None:
     """Check tool name against the built-in/effective + extra deny patterns.
 
@@ -1317,7 +1359,152 @@ def is_denied(
     # keeps the per-rule opt-out semantics exactly as written -- a rule an operator
     # disabled stays disabled at whatever depth it fires.
     publish_sources = [source for source in payload_sources if _argv._is_git_publish(source)]
+    # The SAME descent, kept at its original case, for the two binding checks below. Those read
+    # case-sensitive properties -- git's ``-C`` against ``-c``, and refs -- so they cannot use
+    # ``publish_sources``, which is lowercased. Reading only the top-level ``tool_name`` instead
+    # was a bypass of exactly the wrapper class this floor learned to descend into:
+    # ``bash -c 'git push fork feature-x'`` matched ``_is_git_publish`` on the DESCENDED payload
+    # and so passed the existence gate, while the binding saw the outer line, where the token is
+    # ``'git`` (the quote is not stripped and the word is not a git program name) -- so
+    # ``publish_targets`` found nothing, both checks answered empty, and the push to an unjudged
+    # remote was allowed. Descend for the binding too, and the two readings agree again.
+    try:
+        raw_payload_sources = _argv._shell_payload_sources(tool_name)
+    except Exception:
+        raw_payload_sources = [tool_name]
+    raw_publish_sources = [
+        source for source in raw_payload_sources if _argv._is_git_publish(source.lower())
+    ] or [tool_name]
     if publish_sources:
+        # A command line that both PUBLISHES and moves ``HEAD`` cannot be judged here at
+        # all: this gate runs before execution, so the commit that would be pushed does
+        # not exist yet and any check performed now describes a state the command is
+        # about to replace. Refuse rather than judge the pre-mutation state.
+        #
+        # Unconditional in the sense that matters -- no per-rule opt-out, so the gated
+        # party cannot switch it off -- but still only reached on an installation whose
+        # operator ACTIVATED push-verdict gating. Without that guard this branch would
+        # refuse ``git commit && git push`` on every install on the next release, which is
+        # a large unrequested behaviour change and not what this issue asks for.
+        #
+        # ``activation`` lets an ASYNC caller resolve the keystone OFF the event loop and pass
+        # the result in, so the synchronous read below never runs on the loop (the
+        # no-blocking-call-on-event-loop finding). When it is None -- a synchronous caller, or
+        # one that did not pre-resolve -- the read happens inline here exactly as before, so the
+        # change is additive and no existing caller's behaviour moves.
+        if activation is not None:
+            if activation.unreadable_detail is not None:
+                _emit_deny_event(tool_name, _argv._GIT_PUBLISH_DENY_LABEL, lower)
+                return _reason(
+                    _argv._GIT_PUBLISH_DENY_LABEL,
+                    push_verdict.activation_unreadable_detail(activation.unreadable_detail),
+                    rule="git-publish-activation-unreadable",
+                    component="git-publish-floor",
+                )
+            activated = activation.enabled
+        else:
+            try:
+                activated = push_verdict.activation_enabled()
+            except push_verdict.ActivationUnreadable as exc:
+                # Activation state is UNKNOWN, not off. Refusing here is the fail-closed
+                # direction: an operator who activated this gate does not lose it because one
+                # file became unreadable, and an installation that never activated cannot reach
+                # this branch at all, because absence returns false instead of raising.
+                _emit_deny_event(tool_name, _argv._GIT_PUBLISH_DENY_LABEL, lower)
+                return _reason(
+                    _argv._GIT_PUBLISH_DENY_LABEL,
+                    push_verdict.activation_unreadable_detail(str(exc)),
+                    rule="git-publish-activation-unreadable",
+                    component="git-publish-floor",
+                )
+        if activated:
+            for publish_source in publish_sources:
+                fused = push_verdict.git_mutating_subcommand(publish_source)
+                if fused:
+                    _emit_deny_event(tool_name, _argv._GIT_PUBLISH_DENY_LABEL, lower)
+                    return _reason(
+                        _argv._GIT_PUBLISH_DENY_LABEL,
+                        push_verdict.mutation_detail(fused),
+                        rule="git-publish-fused-mutation",
+                        component="git-publish-floor",
+                    )
+            # A verdict names ONE tree. This gate cannot resolve which tree a command will
+            # run in -- it reads no filesystem and cannot see the shell's working directory
+            # -- so a publish that redirects git elsewhere is REFUSED rather than judged
+            # against a verdict that may describe a different repository.
+            #
+            # Read from the RAW input rather than from ``publish_sources``: those come from
+            # ``_shell_payload_sources(lower)`` and are LOWERCASED, while git's ``-C``
+            # (point at another repository) and ``-c`` (set one config value) differ by case
+            # alone. A lowercased source cannot tell them apart, and matching ``-c`` would
+            # refuse an ordinary configured publish. Any case-sensitive property of a
+            # command has to be read here, before the lowercasing.
+            redirect = next(
+                (
+                    found
+                    for found in (
+                        push_verdict.redirects_repository(source) for source in raw_publish_sources
+                    )
+                    if found
+                ),
+                "",
+            )
+            if redirect:
+                _emit_deny_event(tool_name, _argv._GIT_PUBLISH_DENY_LABEL, lower)
+                return _reason(
+                    _argv._GIT_PUBLISH_DENY_LABEL,
+                    push_verdict.redirection_detail(redirect),
+                    rule="git-publish-redirected-repository",
+                    component="git-publish-floor",
+                )
+            # The verdict question. Read from THIS process's memory -- no file, no ref
+            # read, no subprocess -- so a slow mount cannot stall the permission gate.
+            #
+            # Keyed on the CALLING SESSION, so a session cannot borrow another's pass and
+            # cannot ask about one worktree then publish from a different one: it never
+            # names a worktree at all, its own identity selects the record.
+            #
+            # An absent verdict DENIES here, which is the opposite direction from
+            # ``activation_enabled``'s failure mode and deliberately so: once an operator
+            # has turned this on, a publish with no recorded pass is exactly the silent
+            # omission the gate exists to catch.
+            if (verdict := push_verdict.verdict_for(session_key)) is None:
+                _emit_deny_event(tool_name, _argv._GIT_PUBLISH_DENY_LABEL, lower)
+                return _reason(
+                    _argv._GIT_PUBLISH_DENY_LABEL,
+                    push_verdict.absent_detail(),
+                    rule="git-publish-no-push-verdict",
+                    component="git-publish-floor",
+                )
+            # Existing is not the same as APPLYING. The verdict names one branch, one remote
+            # and one pair of commits, so a publish that names something else was never
+            # judged: pushing a different branch, pushing to a fork, or writing this commit
+            # onto a ref the guard never examined all passed the check above while being
+            # nothing the guard looked at.
+            #
+            # Read from the RAW input for the same reason the redirection check is, one
+            # branch further up: ``publish_sources`` are lowercased, and refs are
+            # case-sensitive, so ``HEAD`` and a branch named ``Fix`` cannot be compared
+            # against a lowercased copy of the command line.
+            mismatch = next(
+                (
+                    found
+                    for found in (
+                        push_verdict.publish_mismatch(verdict, source)
+                        for source in raw_publish_sources
+                    )
+                    if found
+                ),
+                "",
+            )
+            if mismatch:
+                _emit_deny_event(tool_name, _argv._GIT_PUBLISH_DENY_LABEL, lower)
+                return _reason(
+                    _argv._GIT_PUBLISH_DENY_LABEL,
+                    mismatch,
+                    rule="git-publish-verdict-mismatch",
+                    component="git-publish-floor",
+                )
         floor_tags: frozenset[str] = frozenset()
         for publish_source in publish_sources:
             floor_tags |= _argv._git_publish_floor_tags(publish_source)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import threading
@@ -382,6 +383,39 @@ class TestConfigWiring:
         """pool_size > 10 is clamped to 10."""
         mgr, _ = _make_manager(pool_size=100)
         assert mgr._pool_size == 10
+
+    @pytest.mark.asyncio
+    async def test_activation_drift_sweep_is_armed_even_when_the_pool_is_disabled(self):
+        """``start_pool`` arms the pool-INDEPENDENT activation-drift sweep at ``pool_size=0``.
+
+        The default install has no warm pool, so ``_pool_health_loop`` never starts -- but the
+        between-turns activation-drift reap must still run. ``start_pool`` therefore arms a
+        dedicated ``_activation_drift_sweep_loop`` regardless of pool size.
+
+        Mutation check: the fix moved the health-tick hooks OUT of ``_pool_health_loop`` into
+        this dedicated loop and arms it unconditionally. If the sweep were left inside the
+        pool-gated loop (the pre-fix state), ``_drift_sweep_task`` would stay None here and this
+        fails; the health task stays None because the pool is disabled, proving the sweep is not
+        riding on the pool loop.
+        """
+        from unittest.mock import AsyncMock
+
+        mgr, _ = _make_manager(pool_size=0)
+        mgr._ensure_background = AsyncMock()  # type: ignore[method-assign]
+        mgr._pool._stamp_privacy_headers_for_startup = AsyncMock()  # type: ignore[method-assign]
+        mgr._fill_warm_pool = AsyncMock()  # type: ignore[method-assign]
+        try:
+            await mgr._pool.start_pool(blocking=True)
+            assert mgr._pool._drift_sweep_task is not None, "drift sweep not armed at pool_size=0"
+            assert (
+                mgr._pool_health_task is None
+            ), "health loop must stay off when the pool is disabled"
+        finally:
+            task = mgr._pool._drift_sweep_task
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
 
 # ---------------------------------------------------------------------------
@@ -1125,6 +1159,87 @@ class TestPoolHealthLoop:
         healthy1.shutdown.assert_not_awaited()
         healthy2.shutdown.assert_not_awaited()
         mgr._schedule_replenish.assert_called_once()
+
+    # ── GPT c412: proactive push-verdict activation-drift reap ──
+    #
+    # A warm-pool provider is an approved, idle runtime issuing no tool calls and past no
+    # turn boundary, so the ACP per-call/per-turn drift guards never fire for it. When an
+    # operator activates gating AFTER it was spawned, it still holds credentials an activated
+    # install must withhold -- so the periodic sweep must retire it (and its process tree)
+    # before any claimant uses it.
+
+    @staticmethod
+    def _provider_spawned(pre_activation: bool | None):
+        p = _make_provider()
+        p.client = MagicMock()
+        p.client._spawn_push_verdict_activation = pre_activation
+        return p
+
+    @pytest.mark.asyncio
+    async def test_pre_activation_provider_retired_once_gating_is_active(self):
+        """Gating now ON + provider spawned pre-activation -> discarded by the sweep.
+
+        Mutation check: without the proactive reap the pre-activation provider survives the
+        sweep (it is alive and under TTL), so ``shutdown`` is never awaited and this fails.
+        """
+        mgr, _ = _make_manager(pool_agent="kirocrew")
+        mgr._pool._push_verdict_masks_ssh = staticmethod(lambda: True)
+        stale = self._provider_spawned(pre_activation=False)
+        fresh = self._provider_spawned(pre_activation=True)
+        mgr._warm_pool.put_nowait((stale, time.monotonic()))
+        mgr._warm_pool.put_nowait((fresh, time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        stale.shutdown.assert_awaited_once()
+        fresh.shutdown.assert_not_awaited()
+        assert mgr._warm_pool.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_pre_activation_provider_kept_when_gating_is_off(self):
+        """Gating OFF: a pre-activation provider is NOT reaped (no regression on the common case)."""
+        mgr, _ = _make_manager(pool_agent="kirocrew")
+        mgr._pool._push_verdict_masks_ssh = staticmethod(lambda: False)
+        stale = self._provider_spawned(pre_activation=False)
+        mgr._warm_pool.put_nowait((stale, time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        stale.shutdown.assert_not_awaited()
+        assert mgr._warm_pool.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_activated_spawn_provider_not_reaped_even_when_gating_is_active(self):
+        """A provider spawned UNDER activation (stamp True) is never a drift candidate."""
+        mgr, _ = _make_manager(pool_agent="kirocrew")
+        mgr._pool._push_verdict_masks_ssh = staticmethod(lambda: True)
+        fresh = self._provider_spawned(pre_activation=True)
+        mgr._warm_pool.put_nowait((fresh, time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        fresh.shutdown.assert_not_awaited()
+        assert mgr._warm_pool.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_unreadable_activation_fails_closed_and_reaps(self):
+        """An unreadable keystone fails CLOSED: the pre-activation provider is still retired."""
+        mgr, _ = _make_manager(pool_agent="kirocrew")
+
+        def _boom() -> bool:
+            raise RuntimeError("keystone unreadable")
+
+        mgr._pool._push_verdict_masks_ssh = staticmethod(_boom)
+        stale = self._provider_spawned(pre_activation=False)
+        mgr._warm_pool.put_nowait((stale, time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        stale.shutdown.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
