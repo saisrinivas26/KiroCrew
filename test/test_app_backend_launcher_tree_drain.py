@@ -613,6 +613,65 @@ class TestStopOfAnExitedRoot:
         ], "the record and the pidfile row must vouch by the SAME token"
 
 
+class TestOrdinaryStopOfALiveRootKeepsTheRowOnlyForASurvivor:
+    """An ordinary stop (no withdrawn ceiling) of a LIVE root signals the group,
+    the root exits on the SIGTERM, and the wait returns. The pidfile recovery row
+    is put back ONLY when a descendant actually outlived the root -- the sole
+    evidence of which is the port still accepting connections. A clean stop (the
+    port is dead) drops the row, so a backend that genuinely stopped leaves no row
+    for a later start to re-adopt instead of launching fresh."""
+
+    @pytest.fixture(autouse=True)
+    def _posix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(bmod.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(bmod.platform_compat, "IS_POSIX", True)
+        # Forcing IS_POSIX makes the pidfile WRITE path (atomic_write ->
+        # fchmod_safe) take its POSIX branch, which calls os.fchmod -- a name that
+        # does not exist on a real Windows runner. The permission bit is irrelevant
+        # to what this test asserts (the stop's drop/keep decision), so neutralise
+        # fchmod_safe to its documented Windows no-op and keep the test OS-independent.
+        monkeypatch.setattr(bmod.platform_compat, "fchmod_safe", lambda *_a, **_k: None)
+        # The root exits on SIGTERM, so the signal and wait are both no-ops here;
+        # only the port probe decides the row's fate.
+        monkeypatch.setattr(bmod, "_signal_backend_tree", lambda *_a, **_k: None)
+
+    def _seed_row(self) -> None:
+        # Write the row DIRECTLY with an explicit start_time rather than through
+        # _record_app_pid, whose start_time comes from a platform probe we would
+        # otherwise have to stub per-OS. The seeded start_time must equal the tracked
+        # record's, or the conditional forget declines and the row would persist for
+        # an unrelated reason -- masking what this test checks.
+        bmod._write_pidfile(
+            {"svc": {"pid": 6100, "start_time": "ST-9", "port": 9100, "spawn_instance": "inst-1"}}
+        )
+        row = bmod._read_pidfile().get("svc")
+        assert (
+            row is not None and row.get("start_time") == "ST-9"
+        ), "precondition: the row is seeded with the tracked start_time"
+
+    def test_a_clean_stop_drops_the_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._seed_row()
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda _port: False)
+        _track("svc", _FakeProc(pid=6100, returncode=None), "ST-9")
+        assert bmod.stop_app_backend("svc") is True
+        assert "svc" not in bmod._processes
+        assert "svc" not in bmod._read_pidfile(), (
+            "a clean ordinary stop (nothing left on the port) must DROP the recovery row, "
+            "not re-persist it -- a stale row could be re-adopted by a later start"
+        )
+
+    def test_a_survivor_keeps_the_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._seed_row()
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda _port: True)
+        _track("svc", _FakeProc(pid=6100, returncode=None), "ST-9")
+        assert bmod.stop_app_backend("svc") is True
+        assert "svc" not in bmod._processes
+        assert "svc" in bmod._read_pidfile(), (
+            "a descendant still answering the port is TOLERATED, and its recovery row is "
+            "kept so a later re-enable can re-attribute the surviving listener"
+        )
+
+
 class TestStopOfAnExitedRootUnderAWithdrawnCeiling:
     """``_retry_if_serving`` is the ceiling-revocation caller's stricter reading. The
     live-root branch refuses and restores tracking when something still serves;
