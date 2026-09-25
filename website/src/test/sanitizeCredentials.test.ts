@@ -138,3 +138,106 @@ describe('sanitizeCredentials: JWT family', () => {
     }
   })
 })
+
+describe('sanitizeCredentials: key-anchored AWS spellings', () => {
+  const TAG = '[REDACTED: credential]'
+
+  it('keeps the key and separator and replaces only the value', () => {
+    expect(sanitizeCredentials('aws_secret_access_key=test-secret-not-a-credential-0123')).toBe(
+      'aws_secret_access_key=[REDACTED]',
+    )
+    expect(sanitizeCredentials('SessionToken: test-session-not-a-credential-0123 # x')).toBe(
+      'SessionToken: [REDACTED] # x',
+    )
+    expect(sanitizeCredentials('AccessKeyId = test-key-id-not-a-credential-0123')).toBe(
+      'AccessKeyId = [REDACTED]',
+    )
+  })
+
+  it("is a fixed point over the backend's own redacted output", () => {
+    for (const line of [
+      `aws_secret_access_key=${TAG}`,
+      `SessionToken: ${TAG} # trailing`,
+      `AccessKeyId = [REDACTED: encoded credential]`,
+      `{"aws_secret_access_key": "${TAG}"}`,
+    ]) {
+      expect(sanitizeCredentials(line)).toBe(line)
+    }
+  })
+
+  it("is a fixed point over the backend's QUOTED output, key kept outside the quotes", () => {
+    // The backend replaces only the value and keeps the quotes around it, so a
+    // redacted `.env` / shell / YAML / JSON pair reaches this mirror with the
+    // key OUTSIDE the quotes and the tag INSIDE them. The key group has to
+    // admit that opening quote (and the quote after a JSON key) exactly as the
+    // backend's label rule does, or the value group starts at the `"`, the tag
+    // atom fails, and the mirror re-collapses certified-clean text to
+    // `aws_secret_access_key=[REDACTED] credential]"`.
+    for (const line of [
+      `aws_secret_access_key="${TAG}"`,
+      `SessionToken='${TAG}' # trailing`,
+      `AccessKeyId: "[REDACTED: encoded credential]"`,
+      `"aws_secret_access_key": "${TAG}",`,
+      `aws_secret_access_key: "${TAG}"\nnext: line`,
+    ]) {
+      expect(sanitizeCredentials(line)).toBe(line)
+    }
+  })
+
+  it('replaces a quoted plaintext value inside its quotes', () => {
+    expect(sanitizeCredentials('aws_secret_access_key="test-secret-not-a-credential-0123"')).toBe(
+      'aws_secret_access_key="[REDACTED]"',
+    )
+    expect(sanitizeCredentials('{"SessionToken": "test-session-not-a-credential-0123", "r": 1}')).toBe(
+      '{"SessionToken": "[REDACTED]", "r": 1}',
+    )
+    expect(sanitizeCredentials("AccessKeyId='test-key-id-not-a-credential-0123'")).toBe(
+      "AccessKeyId='[REDACTED]'",
+    )
+  })
+
+  it('leaves a run of whole tags alone and redacts a run with glued bytes', () => {
+    // Two credentials that stood side by side inside one value are two adjacent
+    // tags in the backend's output; the mirror reads the run whole instead of
+    // re-collapsing its head at the second tag's interior space.
+    const encoded = '[REDACTED: encoded credential]'
+    for (const line of [
+      `aws_secret_access_key=${TAG}${TAG}`,
+      `aws_secret_access_key="${TAG}${encoded}"`,
+      `SessionToken: ${TAG}${TAG} # trailing`,
+    ]) {
+      expect(sanitizeCredentials(line)).toBe(line)
+    }
+    const glued = `aws_secret_access_key=${TAG}${TAG}test-secret-not-a-credential-0123`
+    expect(sanitizeCredentials(glued)).toBe('aws_secret_access_key=[REDACTED]')
+  })
+
+  it('is a fixed point over its own output', () => {
+    const once = sanitizeCredentials('aws_session_token=test-session-not-a-credential-0123')
+    expect(sanitizeCredentials(once)).toBe(once)
+  })
+
+  it('redacts a value that only resembles a tag', () => {
+    for (const lookalike of [
+      '[REDACTEDtest-secret-not-a-credential-0123',
+      '[REDACTED:credential]test-secret-not-a-credential-0123',
+      '[redacted:test-secret-not-a-credential-0123',
+    ]) {
+      const out = sanitizeCredentials(`aws_secret_access_key=${lookalike}`)
+      expect(out).toBe('aws_secret_access_key=[REDACTED]')
+      expect(out).not.toContain('test-secret-not-a-credential-0123')
+    }
+  })
+})
+
+describe('sanitizeCredentials: a tag with bytes glued to it is a value', () => {
+  it('redacts the whole glued value and leaves a boundary-separated tail alone', () => {
+    const glued = 'aws_secret_access_key=[REDACTED: credential]test-secret-not-a-credential-0123'
+    const out = sanitizeCredentials(glued)
+    expect(out).toBe('aws_secret_access_key=[REDACTED]')
+    expect(out).not.toContain('test-secret-not-a-credential-0123')
+
+    const tailed = 'aws_secret_access_key=[REDACTED: credential] tail-not-a-value'
+    expect(sanitizeCredentials(tailed)).toBe(tailed)
+  })
+})

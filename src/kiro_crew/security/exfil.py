@@ -38,6 +38,7 @@ from kiro_crew.credential_patterns import AWS_KEY_ID
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
 
 from .redaction import (
+    CREDENTIAL_REDACTION_TAGS,
     _contains_fixed_credential,
     _text_contains_bare_secret,
     redact_credentials,
@@ -665,13 +666,35 @@ def _is_safe_presigned(domain: str, query: str) -> bool:
 # the PATH). Distinct from the broader _EXFIL_PATTERNS base64/length heuristics,
 # which stay query-only (long base64 PATH segments — CDN asset ids, git object
 # hashes — are benign).
+#
+# A key-anchored branch declines a value that is one of the redactor's own tags
+# (or a run of them) and nothing else: the redactor keeps the key that names a
+# value and replaces the value alone, so text it already cleaned reads
+# ``aws_secret_access_key=[REDACTED: credential]`` and would otherwise be a hard
+# credential to every presence-only reader of this pattern (the decoded-URL
+# gate below, the packaging scan's ``repo-credential-detector``). Built from the
+# registry, and case-sensitive inside this case-insensitive pattern, so a
+# lookalike in another case is a value exactly as it is to the redactor; a tag
+# with bytes glued to its ``]`` is a value too and still matches.
+_NOT_A_REDACTION_TAG_VALUE = (
+    "(?!(?-i:(?:"
+    + "|".join(re.escape(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+    + ")+)(?:[\\s\"',}]|$))"
+)
+
+
+def _hard_key_anchored(keys: str) -> str:
+    """One ``key[:=]value`` alternative of ``_HARD_CREDENTIAL_RE`` for *keys*."""
+    return "|(?:" + keys + r')["\']?\s*[:=]\s*["\']?' + _NOT_A_REDACTION_TAG_VALUE + r'[^\s"\',}]+'
+
+
 _HARD_CREDENTIAL_RE = re.compile(
     r"(?:"
     f"{AWS_KEY_ID}"  # AWS access key ID (shared spelling: credential_patterns)
-    r'|(?:SecretAccessKey|aws_secret_access_key)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    r'|(?:SessionToken|aws_session_token)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    r'|(?:AccessKeyId|aws_access_key_id)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
+    + _hard_key_anchored("SecretAccessKey|aws_secret_access_key")
+    + _hard_key_anchored("SessionToken|aws_session_token")
+    + _hard_key_anchored("AccessKeyId|aws_access_key_id")
+    + r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
     r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
     r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
     r")",

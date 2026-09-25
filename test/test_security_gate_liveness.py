@@ -153,12 +153,77 @@ def _url_payload_command(n: int) -> str:
 #: Windows file too large to hash on the gate is never served, so a dotless target
 #: there is pending, and the ssh self-target refusal note says so.
 #:
+#: Re-pinned from 28,399 for the value-only span of the key-anchored branches in
+#: ``redaction.py``: each of the four branches that begins at the key naming a
+#: secret (the three AWS key-value forms and ``Authorization: Bearer``) exposes its
+#: value as one named group, ``_credential_value_span`` redacts that group alone,
+#: and the key survives. What the kept key costs in lines is the fixed point it
+#: needs: the registered tags embedded in every value group as one atom, the
+#: whole-value tag skip pass 1 shares with pass 4, the quoted-value boundary
+#: (``_quoted_value_end``), the straddle clamp, the coalescing sweep in pass 4 and
+#: the strict-prefix atom the streaming anchor carries, each with the comment
+#: naming the egress case it closes. No branch widened, no pass added and no
+#: threshold moved.
+#:
+#: Re-pinned from 28,752 for the tag skip's closed-quote condition in pass 1 of
+#: ``redaction.py``: a value that is a registered tag is skipped only when the tag
+#: is proven to fill its value -- unquoted, or quoted with the closing quote on
+#: its line. A quote that never closes certifies nothing, and a quoted string
+#: folds across a raw line break in YAML and the shell, so a tag ending such a
+#: line is left as it is (the bytes are the tag) but WARNED, on every run, so an
+#: author-written tag cannot silence ``decisions.gate.scrub_reason`` while a
+#: continuation line stands. The scan stays line-bounded. Twenty-five lines, all
+#: of them the condition and the comment naming the case; no branch widened.
+#:
+#: Re-pinned from 28,777 for three rules in ``redaction.py`` the server lanes asked
+#: for on that head: a pass-1 claim that runs to the end of an unterminated quoted
+#: line WRITES the closing quote, so the redactor's own output is a closed pair a
+#: re-screen leaves alone in silence while an author-written tag inside an open
+#: quote still warns; ``_value_is_credential_tag`` and ``_CREDENTIAL_TAG_ATOM`` read
+#: a RUN of whole tags as one value (two credentials adjacent inside one value were
+#: two tags that the next run mangled at the second tag's interior space); and
+#: pass 4 coalesces a ``token=`` value fully covered by two or more claims into one
+#: tag on the first run (``_covering_claims``), silently. Sixty-three lines, the
+#: rules and the comments naming the shapes; no branch widened, no pass added.
+#:
+#: Re-pinned from 28,840 for the streaming discard in ``__init__.py``: the
+#: token-parameter discard reads the batch grammar's value shape -- value-class
+#: bytes and WHOLE registered tags -- instead of the plain class, and keeps a
+#: strict tag prefix buffered at a chunk tail (``_trailing_tag_prefix``) both
+#: when the fail-closed drop arms it and while it runs. A ``token=`` value made
+#: of a run of whole tags past the 4096 ceiling armed the drop, and the next
+#: chunk's completed tag ended the discard at its interior space, so the bytes
+#: glued to the tag's ``]`` streamed anchor-less. Fifty-six lines, the helper,
+#: the two call sites and the comments naming the shape; the value class, the
+#: ceiling and the drop bound are unchanged.
+#:
+#: Re-pinned from 28,896 for the presence-only readers of the patterns. Once the
+#: key survives redaction, the redactor's own output ``key=[REDACTED: credential]``
+#: matches its key-anchored branch again, so every reader that only asked "does
+#: the pattern match?" -- the ledger push gate over ``ledger.jsonl``, the deploy
+#: and preview file scans, the exfil request gates, the hard URL regex -- called
+#: cleaned text live (the ledger refused every push from its first redacted entry
+#: on). ``redaction.py`` gains ``_match_is_live_credential`` (pass 1's own skip,
+#: judged on the same extended span), the public ``credential_matches`` and
+#: ``contains_credential`` the readers now go through, and routes
+#: ``_contains_credential_pattern`` through them; ``exfil.py``'s
+#: ``_HARD_CREDENTIAL_RE`` declines a value that is only a registered tag, built
+#: from the registry; ``__init__.py`` and ``_exports.py`` list the two names.
+#: Ninety-two lines, the rule, the two accessors, the lookahead and the comments
+#: naming the readers; no pattern widened, no pass added. Then fifteen more for
+#: `_quoted_value_end`: a DOUBLED quote inside a quoted value is an escaped
+#: interior quote (YAML and SQL ``''``, CSV ``""``), never the close -- reading
+#: the first of the pair as the close let the redactor's own first pass emit
+#: ``key='[REDACTED: credential]''<s2>'`` and the second run skip the tag in
+#: silence with ``<s2>`` standing unwarned. The pair is consumed as value
+#: bytes; the condition and the paragraph naming the bypass.
+#:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 28_399
+_PACKAGE_LINE_BUDGET = 29_003
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
