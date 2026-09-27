@@ -2024,9 +2024,13 @@ enumerates every function in the dashboard package that writes a session's
 folder or project and holds each request-driven writer to that decision; the
 rest — restores, a fork's copy of its source, channel and cron placements from
 configuration, a session's own project — are named there with why they are not
-a filing. The `steering_dirs` declaration gate at both of
-its write sites (`_refuse_agent_steering_dirs`) is main's #11827 rule: an app's
-or a member's declaration is refused with that gate's own 403. The
+a filing. And the `steering_dirs`
+declaration fence at both of its write sites (`_refuse_agent_steering_dirs`)
+keys on the same bit: a steering declaration is a gateway host-file read that
+lands in the person's chats, the same gap class, so every non-person caller is
+refused it with that gate's own 403 — the person alone declares (main refused
+apps and members a declaration and admitted every other caller's); clearing to
+`[]` stays allowed for every principal, as it only removes reads. The
 read side — what a binding confers once it exists — is main's, unchanged: the
 nearest ancestor's binding, for every chat filed beneath it. The PATCH route
 runs `_validate_project_dir` off-loop as the create route does. The conductor
