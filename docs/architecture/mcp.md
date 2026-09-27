@@ -1750,6 +1750,291 @@ the tool layer could only drift or race. What the tool layer still decides is th
 one question the endpoint cannot: whether the caller can be placed at all, since
 an unverifiable or delegated caller has no scope to bound a write to.
 
+**A folder's project directory is the person's to bind, and the routes refuse
+everyone else's.** A chat the person opens inside a folder
+(`POST /api/chat/slots`) inherits the nearest ancestor's `project_dir` at
+creation — before its context is built — and that is the only zero-cost path to
+a project-scoped session: `project_scope_satisfied()` fails closed without one
+(no repo-scoped lessons, no project `.kiro/steering`), context is injected once
+at session start, and `set_project` afterwards tears the session down at the
+turn boundary. (`session_create` files its child but resolves the child's
+project from the caller's workspace, not the folder; #11680 adds that
+inheritance.) An agent that creates a folder still cannot bind it (#10432): no
+tool on this server carries `project_dir`, and the folder routes refuse a
+non-person caller's `project_dir` whole, at create and on the PATCH, set or
+clear, before the path is looked at (`chat_folders._agent_binding_refusal`,
+403 `folder_project_dir_forbidden`, audited under `app_isolation` against
+attested identity only — the caller's principal, else the token subject the
+middleware validated, else the `X-Session-Key` the AF_UNIX peer check
+kernel-attested (`request["peer_verified"]`), else `unattributable`; a bare
+header is caller-chosen on TCP loopback and never names the row's caller). WHO
+is the person is two POSITIVE facts,
+`_is_the_person`: `request["is_dashboard_user"] is True`, the stamp the token
+middleware sets only when a non-app dashboard token validated — the person's
+own cookie or session token behind the sidebar's Folder settings — AND the
+repo's owner predicate (`handlers.source_providers.is_owner_dashboard_request`:
+the token's subject is the configured owner, `KIROCREW_OWNER_ID`, or on an
+install with no owner the machine-local bootstrap identity). The stamp alone
+proves only the token's class: an allow-listed messaging user who asks the bot
+for a dashboard link (Slack's `!dashboard`) holds an app-less token that
+validates like the person's and carries the same stamp, so the owner conjunct
+is what keeps that user's binding out of the owner's chats. The same conjunct
+denies the operator's own session from before `KIROCREW_OWNER_ID` was
+configured (a token's subject is fixed at mint and kept by every refresh, so it
+carries `local-app`/`local-startup` for life); that caller is not admitted —
+one definition of the person — but every refusal the predicate decides runs
+through one tail, `_person_gate_refusal`, which answers that one caller with the
+repo's `401 stale_session_reauth` (`stale_owner_session_response`, the same
+tail every owner gate runs) instead of the agent's 403, so signing in again is
+signalled where it is the remedy; an app's token, the internal transport and the
+allow-listed user keep the 403. The
+internal-secret transport (the managed MCP set, so every agent session's tool
+call: an ordinary dashboard session's, a crew member's, an app's, a cron's, a
+subagent's, a channel session's) never sets the stamp, an app's own token sets
+it `False`, and a request that met no middleware is refused rather than
+admitted; no caller is sorted by its key.
+An admitted way for an agent to bind a folder is a follow-up (#14120): the shape
+tried on this PR — a family of caller-class arms, then one containment rule on
+the agent's own project directory — drew a finding on every head, the last of
+them that a bound directory inside the agent's own tree can be swapped for a
+link after the check, so it ships as nothing rather than as a rule with a known
+hole.
+
+The path checks are the endpoint's: `chat_folders._validate_project_dir` (main's
+own validator by name, the person's -- a non-person `project_dir` is refused
+whole before it runs) and the
+workspace-overlap guard run inside the routes. The PERSON's request takes
+`_validate_project_dir`, main's own resolution by name: absolute or
+`~`-prefixed, `realpath`, never a sensitive location, an existing directory — a
+share by its UNC spelling included, exactly as before this change. The UNC rule
+is new and scoped to every OTHER principal (`screen_and_resolve_project_dir`): the
+probe it prevents is a caller other than the operator steering the gateway onto
+a host of that caller's choosing, and that threat does not exist when the
+operator picks a path for the operator's own gateway. It has two halves. The
+lexical half, `project_dir_unc_refusal`: a UNC-shaped `project_dir`
+(`\\host\share`, `//host/share`, `\\?\UNC\host\share`) from a non-person
+principal names a host that a Windows gateway's `realpath` would contact over
+SMB, so the shape is refused before any filesystem call — on every host, since
+that path text is untrusted everywhere — through the repo's one UNC gate
+(`hooks.is_unc_shape` / `unc_probe_allowed`); admission-only, at the
+`set_project` directive (an agent's tool), a non-person request at the slot
+project endpoint, and any folder route a non-person
+`project_dir` reaches (none does: `_agent_binding_refusal` refuses it whole, and the scaffold routes refuse every non-person caller before the root is read
+first). The link half (inside `screen_and_resolve_project_dir`): `realpath` follows
+every link in a path, and a LOCAL link whose target is a share makes the gateway
+open the share on the way — the probe one link away — so before anything follows
+a link on a non-person path, the repo's one link-target screen
+(`hooks.link_screen`, the walk `validate_file_path` already runs for file
+reads, made platform-neutral and given a per-cause answer) reads each link on
+the way (the first linked ancestor, root-first, then the leaf) with
+`os.readlink`, never following it, refuses a share-shaped target, and hands back
+the path re-spelled through every link it read — a spelling that holds no link
+the walk saw. The walk resolves in component order, the kernel's own: on POSIX
+no `..` is folded before it (`chat_folders._anchored_spelling` only anchors a
+relative path), so `work/link/../sibling` with `link -> projects/team/subdir`
+reaches `projects/team/sibling` as `realpath` does, never the link's own
+`../sibling`; on Windows the Win32 parser folds `..` before any filesystem sees
+a name, so `abspath` there is the platform's rule and is applied first. A
+request whose link the screen cannot read or place is refused apart from the
+share-shaped cause — `PROJECT_DIR_UNSCREENABLE_LINK_REFUSAL`, and at the slot
+project endpoint its own code `project_dir_link_unscreenable`, audited
+`unscreenable link` rather than as a UNC path. That screened spelling, never
+the original, is what gets resolved next, and never by name:
+`pinned_fs.real_dir_path_pinned` opens every component without following a link
+and reads the real path back from the directory it holds (`pinned_fs.fd_real_path`)
+— on POSIX an `openat` chain under `O_NOFOLLOW` (`pinned_fs.open_in_pinned_parent`
+with `traverse_flags`: `O_PATH` where the platform has it, so the chain needs
+only the search permission a by-name `realpath` needs and a directory under a
+search-only ancestor still resolves; a link or a file at a component is still
+`ENOTDIR`), on Windows a root-first chain of handles opened with
+`FILE_FLAG_OPEN_REPARSE_POINT` and held without `FILE_SHARE_DELETE`
+(`platform_compat.pin_directory`), so nothing above a held component can be
+renamed or re-pointed while the walk runs and a reparse point at any name is
+opened as itself and refused; a reparse point that redirects nothing (a
+cloud-files placeholder — OneDrive marks every synced folder that way) passes as
+the directory it is. A component swapped for a link between the screen and the
+open is therefore refused at the open on every host (`PROJECT_DIR_UNVERIFIABLE_REFUSAL`),
+a component this process may not traverse answers `PROJECT_DIR_UNOPENABLE_REFUSAL`
+(the slot endpoint's `project_dir_unopenable`) rather than a "retry", a spelling
+no filesystem can carry answers the missing-directory refusal on both arms
+instead of a server error, and a host that can pin neither way fails closed
+rather than falling back to `realpath`. The sensitive-path verdict at those
+sites is taken on the pinned real path — and, for a path the open does not find,
+on the link-free spelling — as it stands (`project_dir_sensitive_refusal` over
+`is_sensitive_resolved_path`, on the worker thread), never by resolving the name
+again: `is_sensitive_path` walks its argument before matching, and after the pin
+that walk would follow a component swapped for a link. The same screen-and-resolve call
+(`chat_folders.screen_and_resolve_project_dir`) runs on a worker thread for the
+`set_project` directive and the slot project endpoint's non-person arm, so
+neither holds a `realpath` of its own and neither resolves on the event loop;
+the endpoint's person arm runs main's `realpath` off the loop too. The READ path
+(`_resolve_folder_project_dir`, the stored-value reader on slot create and agent
+switch) is main's by-name resolution for every stored value and runs neither
+half: only the person binds a folder, so every stored binding is a path the
+operator chose, honoured as it always was — a share by its UNC name, a local
+link to one, a chain the screen could not read. What none of this does is
+contain the person's path to any root: the person binds any directory that is
+not sensitive, as before. The pin itself is RELEASED when the value is stored
+(`screen_and_resolve_project_dir` returns a real path, a name again), and the
+spawn that enters it is deferred to the next turn — so every BINDING records
+what the spawn re-verifies, on the SLOT (`slot.project_identity`,
+`(spelling, st_dev, st_ino)`, held in memory beside `project`): the two agent arms
+record the held directory's identity (`identity_out`), the person's own choice
+and a folder's inherited binding at creation record the identity read off the
+descriptor that opened the resolved directory without following a link at it
+(`sandbox.directory_identity_pinned`, on the validating worker thread -- never a
+by-name `stat` after validation; the fenced resolve reads it off the held chain
+inside `real_dir_path_pinned(identity_out=)` before the chain closes), the
+agent-switch route records the folder project's identity the same way, a fork
+copies its source's record, an unknown identity (a volume reporting no inode)
+is recorded as the UNAVAILABLE state (opened at spawn, not compared), and a
+directory the binding cannot pin is a FAILED BIND refused to the caller
+(`sandbox.WorkspacePinFailed`), never a record-less binding; the workspace default
+-- what configuration hands a slot that chose none, and the warm pool's own
+directory -- is not a binding: it records nothing, is not examined at spawn, and
+keeps the warm path. The record lives for the
+gateway process's lifetime and is never persisted (`st_dev` is reassigned across
+mounts; the transcript store is agent-writable): a slot restored after a restart
+carries no record, and its first spawn re-pins the bound path as it stands
+(`state.spawn_project_identity_repinned`) -- a swap of the directory while the
+gateway was down is outside the threat, which is a swap between validation and a
+deferred spawn within one gateway lifetime; a directory the re-pin cannot open (a
+link planted at the bound name) refuses the spawn as the governed error, never an
+unexamined `None`, which only a slot with no binding carries; two first spawns of
+one restored slot that re-pin concurrently keep the record the first commits (the
+second returns it and its spawn verifies against it). Bind, restart re-pin
+and spawn verification share one identity function per platform
+(`sandbox.open_pinned_directory`: Windows root-first no-reparse walk; POSIX
+`O_NOFOLLOW | O_DIRECTORY` leaf open + `fstat`). One identity
+function serves every recorder and the check (`platform_compat.handle_identity`,
+composed as `os.stat` composes the pair). The record travels with `cwd` to the spawn
+(`sessions.get_or_create(cwd_identity=...)` → the provider factory →
+`AcpClient` / `AcpRuntime` `work_dir_identity`) -- and `get_or_create` is the one
+seam every spawn of a bound slot passes through: a `cwd` handed over with no
+identity (the side panel and the crewmate thread once did) is resolved there
+against the slots bound to it, so `None` reaches the factory only for a directory
+no slot is bound to -- and the agent PROCESS's spawn
+(`sandbox.verify_agent_workspace_for_spawn`) checks by IDENTITY, not by
+refusing links — the threat is a swap of the bound directory, so a benign link
+an ancestor has always crossed is not a swap, and a binding with no identity is
+not examined and spawns exactly as before. A recorded binding is re-read with
+no link followed (POSIX: the leaf, `O_NOFOLLOW` open; Windows: the whole chain
+root-first, every component opened as itself and its reparse tag judged before
+the next is opened, so a junction at an ancestor is refused without being
+resolved, the identity off the final handle, the chain handed back OPEN as the
+hold the spawn keeps until `CreateProcess` has returned) and
+compared: a leaf that is now a link, or missing, refuses the spawn as a
+governed refusal, and so does a DIFFERENT directory at the name -- the swap of
+the bound directory is the threat, and the remedy the error names (re-bind, which
+re-records) is how a re-clone recovers (a binding recorded unavailable, or an
+identity that reads back unknown, is logged and the spawn proceeds). The
+macOS voice-runtime pre-flight the fenced sites run after the verdict compares the
+pinned real path as it stands (`pre_resolved=True`), never re-walking it by name. — the site's own error naming the remedy,
+re-bind the directory (the person's re-bind of a recreated directory re-records
+it and, the identity having changed under the same spelling, arms the deferred
+reset a spelling change arms -- endpoint and `set_project` directive alike -- so
+the live provider is cold-started out of the replaced directory; a second session
+on the same path carries its own record) — equal, the spawn
+enters the verified directory's real path, and the hold the check left open --
+the POSIX descriptor, the Windows handle chain -- spans the process creation and
+is released on a worker thread scheduled after the PID bookkeeping (no await
+between a live child and its record). What the platforms buy, and stated: on
+macOS with the internal sandbox the child enters a descriptor verified by
+identity to be the checked directory (`refuse_unless_bound_workspace_is_pinned`);
+every other POSIX spawn of a bound directory enters the descriptor the check
+itself holds, handed to `create_subprocess_limited` as `chdir_fd` — the pathname
+leaves the spawn and the shim `fchdir`s the inherited descriptor — so a same-UID
+rename of the verified directory, or a link planted at its name, between the
+check and the fork cannot redirect the spawn: the descriptor names the directory,
+not the spelling (an earlier head entered the verified spelling by name, which the
+fork child's `chdir` re-resolved, so a rename with a link planted in between sent
+the agent wherever the link pointed — review-caught, security-class). On Windows
+the held chain covers that window: every component stays held without
+`FILE_SHARE_DELETE` until `CreateProcess` has returned, so the name the child
+enters can be neither renamed nor re-pointed at a junction in between (an earlier
+head closed the chain before the check returned, so the spawn entered a name a
+same-UID swapper could re-point at a junction to a share — review-caught,
+security-class). A directory bound with no identity spawns by name as it always
+did. On every platform the protocol-boundary window
+`AcpRuntime._session_work_dir` records remains.
+
+Two more rules key on the same bit. A reparent reaches every session filed in
+the moved subtree through inheritance: an UNBOUND folder's subtree resolves its
+nearest bound ancestor, so a non-person caller moving a folder under one that
+carries a binding, or out from under one, would rebind the person's chats filed
+inside it to a directory the person never chose for them. The PATCH's `_apply`
+therefore refuses a `parent_id` change by a non-person caller when the stored
+binding the two places confer differs (`_move_changes_inherited_binding` over
+`_inherited_project_dir`, same 403, decided under the store lock, where a
+concurrent move or a person's PATCH cannot change either side between
+validation and write); a folder carrying its own binding is exempt (nearest
+wins, so its subtree resolves it wherever it sits), and a move between two
+places that confer the same binding lands. The ownership branches stay on the
+folder principal, so an ordinary session still reparents the person's folders
+between places with the same binding, and its unbound folder writes are not
+this rule's concern. The same reparent branch compares the STEERING the moved
+subtree would inherit (`_inherited_steering_dirs`: every ancestor's stored
+declaration with its owner, root-first, validation-free under the lock) and
+refuses a non-person caller's move that changes it with the steering gate's 403
+— a move under a folder declaring steering hands those documents to every chat
+filed in the subtree at its next start, and the binding branch is silent
+whenever both places inherit the same binding. Filing is the one way a session
+ACQUIRES a folder's binding and steering (they reach a chat through the folder it
+is filed in), so every request-driven filing goes through ONE decision,
+`chat_folders.refuse_filing_across_inheritance`, and the decision and the WRITE
+share one section under the folder store lock (`file_slot_across_inheritance`:
+`state.hold_folders` hands the section the committed tree and no folder mutation
+can commit until it returns) at `PATCH /api/chat/slots/{slot}/folder` (behind
+`chat_folder_move_session` and `chat_folder_file_self`) and at `POST
+/api/chat/slots` with a `folder_id` (the route an app's own credential can
+reach; a refusal at the write retracts the slot the request minted, and the
+filing runs before any other write the route makes to the slot — the title pin
+and the artifact binding follow it — so a refusal on an existing slot addressed
+by `name` returns it exactly as found). The agent
+tools `session_create` and `session_fork` apply the same comparison
+(`filing_crosses_inheritance`, from the creator's or the source's own placement
+— a child filed beside its creator inherits nothing the creator lacks) before
+the mint and again ADJACENT to the child's assignment, in the synchronous window
+those tools keep between publishing a slot and configuring it; a folder write in
+flight at that instant refuses (`folder_store_busy`) rather than judging a
+provisional tree, and a refusal there retracts the child. `session_revive`,
+which brings an archived session back and may file it into a named folder,
+takes the same decision from the placement the session was archived in (none
+reads as the top level) to the named folder, BEFORE the revive commits — a
+refused filing revives nothing, files nothing and unhides no folder (the
+structural writer test caught this door when it opened) — and AGAIN at the
+write, under the folder-store lock in one section with the assignment
+(`hold_folders`), as the other request-driven filings are, so a folder mutation
+that commits while the resume awaits (the target acquiring a binding or
+steering) declines the filing there without failing the revive that happened —
+the fork raises because it retracts its child; nothing is retracted here — so
+the call succeeds with `filed: false` and the move rule's code in
+`filing_refused`, and the session comes back where it was archived, nothing
+filed or unhidden (review-caught: the write compared only the slot's own
+placement, so the early decision could go stale across the resume). The
+person is never confined; any other principal may not place a session where it
+would inherit a binding or steering it does not have today — the same two
+comparisons, over the COMMITTED folder tree (`read_folders`: the store lock
+excludes a mutate whose write is still in flight, so a binding clear about to
+roll back is never judged), the slot revalidated after that read, with the same
+two codes — and a filing between places that confer the same binding and
+steering lands. A structural test
+(`test_chat_folder_ownership.py::TestEveryWriterOfASessionsFolderOrProjectIsAccountedFor`)
+enumerates every function in the dashboard package that writes a session's
+folder or project and holds each request-driven writer to that decision; the
+rest — restores, a fork's copy of its source, channel and cron placements from
+configuration, a session's own project — are named there with why they are not
+a filing. The `steering_dirs` declaration gate at both of
+its write sites (`_refuse_agent_steering_dirs`) is main's #11827 rule: an app's
+or a member's declaration is refused with that gate's own 403. The
+read side — what a binding confers once it exists — is main's, unchanged: the
+nearest ancestor's binding, for every chat filed beneath it. The PATCH route
+runs `_validate_project_dir` off-loop as the create route does. The conductor
+grants are unchanged. Precedents for the tool surface this leaves in place:
+#2761 made folders agent-creatable, #6118 made sessions agent-filable at
+creation; the binding is the one step in that progression that stays with the
+person.
+
 **Filing your own session is a separate verb, `chat_folder_file_self`, because
 the grant is name-scoped.** `chat_folder_move_session` takes its target from an
 argument, so it is the one dashboard tool that writes a session OTHER than the

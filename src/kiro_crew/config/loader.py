@@ -5215,6 +5215,7 @@ class KiroCrewConfig:
             channel_id: str | None = None,
             model_override: str | None = None,
             cwd: str | None = None,
+            cwd_identity: tuple[int, int] | None = None,
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
@@ -5351,6 +5352,7 @@ class KiroCrewConfig:
                     )
             return AcpProvider(
                 work_dir=wdir,
+                work_dir_identity=cwd_identity,
                 model=m,
                 agent=agent,
                 crew_agent=crew_agent,
