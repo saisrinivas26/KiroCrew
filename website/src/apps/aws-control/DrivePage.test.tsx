@@ -3348,6 +3348,53 @@ describe('DrivePage sections: error surfaces reach the agent', () => {
     expect(screen.queryByTestId('backup-nightly-sessions-blocked')).toBeNull()
   })
 
+  it('the snapshot grant that cannot run here says so next to its switch', async () => {
+    // The snapshot sibling of the sessions notice: the owner has nightly
+    // snapshots on, the host cannot hold the archive body unrewritable, and
+    // without this line the console shows the switch on while nothing is ever
+    // uploaded -- the loss only surfacing when the host is gone.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightly: true,
+      nightlyBlocked: 'snapshot backups are paused on this host',
+    } as never)
+    await renderDrive('backup')
+
+    const row = await screen.findByTestId('backup-nightly')
+    const blocked = await screen.findByTestId('backup-nightly-blocked')
+    // The notice renders the backend's own cause-specific reason, not a fixed
+    // string: on Linux that names the agent.sandbox setting to re-enable rather
+    // than claiming the platform cannot run snapshots.
+    expect(blocked.textContent).toContain('snapshot backups are paused on this host')
+    // The switch still reads back as the owner set it; flipping it to reflect the
+    // host would answer a question they did not ask.
+    expect(within(row).getByRole('switch').getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('no snapshot blocked notice while that grant is off', async () => {
+    // Nothing is being withheld until the owner asks for it.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightly: false,
+      nightlyBlocked: 'snapshot backups are paused on this host',
+    } as never)
+    await renderDrive('backup')
+    await screen.findByTestId('backup-nightly')
+    expect(screen.queryByTestId('backup-nightly-blocked')).toBeNull()
+  })
+
+  it('no snapshot blocked notice when that grant is on and nothing is in the way', async () => {
+    // The other half, so the notice above cannot be one that renders
+    // unconditionally and tells every healthy install its snapshots are not
+    // being backed up.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup, nightly: true, nightlyBlocked: null,
+    } as never)
+    await renderDrive('backup')
+    await screen.findByTestId('backup-nightly')
+    expect(screen.queryByTestId('backup-nightly-blocked')).toBeNull()
+  })
+
   it('the consent hint states the same scope the archive row does', async () => {
     // The switch authorizes the row above it, so the hint has to say what that row
     // says the payload is: every session under this Kiro home, CLI replay logs

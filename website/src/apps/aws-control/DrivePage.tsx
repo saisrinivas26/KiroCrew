@@ -4181,6 +4181,28 @@ export function BackupSection({ account }: { account: string }) {
             </div>
             <Toggle checked={data.nightly} onChange={(v) => nightlyMut.mutate(v)} label={i18nT('apps.awsControl.console.backup_nightly')} />
           </div>
+          {/* Granted, and not running -- the snapshot sibling of the sessions
+              notice below. Shown only in that combination: with the grant off
+              nothing is being withheld. The switch stays interactive and reads
+              back as the owner set it, while this says the schedule produces
+              nothing on this host (it cannot hold the archive body unrewritable
+              from creation), which is the part they cannot otherwise see until the
+              host is gone -- the event the backup exists to survive. One line
+              rather than the sessions kind's code map: the only condition that
+              reaches the console here is the host-capability one. */}
+          {data.nightly === true && data.nightlyBlocked ? (
+            <div className="px-3 pb-2 text-[12px] text-warn" data-testid="backup-nightly-blocked">
+              {/* Render the backend's own reason: it is a complete, cause-specific
+                  sentence from kind_unavailable_reason -- on Linux it names the
+                  agent.sandbox setting to re-enable, elsewhere it names the platform
+                  limit. A fixed string here would make the "platform cannot" claim
+                  even on a Linux host where the real fix is a setting. Fall back to
+                  the generic label only if the reason is somehow empty. */}
+              {typeof data.nightlyBlocked === 'string' && data.nightlyBlocked.trim() !== ''
+                ? data.nightlyBlocked
+                : i18nT('apps.awsControl.console.backup_nightly_blocked')}
+            </div>
+          ) : null}
           {/* The toggle snaps back on a failed write; without a line under it the
               snap-back reads as a flaky control rather than a refused request.
               Directly under the row it explains, so the snap-back and its reason
