@@ -1580,14 +1580,24 @@ def is_owner(user_id: str) -> bool:
 def disable_yolo() -> None:
     """Disable YOLO mode (global auto-approve).
 
-    Gated on ``has_grant()``, NOT ``is_active()``. The latter is policy-filtered and
-    reports False while the governance verdict is momentarily unknown, so gating an
-    explicit off on it skipped the teardown and let the grant resume once the refresh
-    settled -- the operator's revocation silently undone.
+    Always routes through ``deactivate("slack")`` -- it does NOT pre-gate on
+    ``has_grant()`` / ``is_active()``. Both of those read ``_active``, which is False
+    while a declared grant is SUSPENDED for an ``agent.sandbox`` re-check. Gating the
+    off on either one skips ``deactivate`` entirely during that window, so the
+    explicit-revocation generation (bumped inside ``deactivate`` before its own no-op
+    return) never moves -- and the suspend/finish step then re-arms the grant the
+    operator just revoked. ``deactivate`` itself stays silent when there was genuinely
+    nothing to tear down (no grant ever, already revoked), so an unconditional call is
+    correct and idempotent; the generation bump it records is what makes a revocation
+    during suspension stick.
     """
-    if not safety_override().has_grant():
+    tore_down = safety_override().deactivate("slack")
+    if not tore_down:
+        # Nothing was actually torn down (no grant ever, or already revoked). The
+        # deactivate above still recorded the explicit-revocation generation bump that
+        # a revoke-during-suspension needs, but there is no live trust to clear and no
+        # off to announce -- leave inherited per-session trust untouched.
         return
-    safety_override().deactivate("slack")
     # Through the shared revoke, which undoes BOTH halves of each grant. Dropping
     # only the in-memory mapping leaves every granted session's approval_policy at
     # "auto", and a subagent reads that policy rather than the mapping, so a later
