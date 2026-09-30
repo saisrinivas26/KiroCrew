@@ -158,7 +158,41 @@ def _url_payload_command(n: int) -> str:
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 28_399
+#:
+#: The total covers the recursive-force ``rm`` deletion floor, which lives in its own
+#: ``rm_floor.py`` sibling module: an argv-structural gate that reads the ``rm``
+#: command's own argv (flags in any position/spelling, the ``$HOME``/``~``/glob
+#: targets, ``find -exec`` spans, interpreter ``-c``/``-e`` and stdin/heredoc/
+#: herestring code payloads, exec wrappers, and obfuscated nested spellings), the
+#: sole enforcement for those two rules with their catalog patterns stripped from the
+#: regex tier. The module header and imports it carries are counted here alongside the
+#: relocated code.
+#:
+#: The total also covers three static-decidability closures the floor carries so a
+#: catastrophic ``rm`` cannot hide behind an ordinary shell spelling: brace
+#: expansion of flags and operands before parsing (``_rm_expand_brace_members`` plus
+#: the token pre-pass), so ``rm {--recursive,--force} {/,/tmp}`` is classified as the
+#: flags and roots it expands to; nearest-preceding literal-binding resolution, so a
+#: ``cmd="x"; cmd="rm -rf /"; os.system(cmd)`` sink argument resolves to the command
+#: the interpreter runs rather than an earlier decoy binding; and classification of
+#: an operand that IS the expanded home path (``_rm_expanded_home_path``), so
+#: ``x=$HOME; rm -rf "$x"`` denies. These are the new helpers, their docstrings, and
+#: their wiring at the operand-classification and argv-loop sites; no pass is widened
+#: and no threshold moves.
+#:
+#: The total further covers three fail-open closures on the recursive-force floor:
+#: a standalone redirection word (``_is_redirect_word`` / ``_is_bare_redirect_operator``)
+#: is excluded from both stdin-code script-file scans, so a trailing ``>/dev/null``
+#: is not mistaken for the interpreter's script file and a piped ``rm -rf /`` producer
+#: stays classified; the first-argument position advances only for a word that
+#: contributed a flag or an operand, so a shell-elided empty word (``rm "" -rf /etc``)
+#: does not disarm base's contiguous ``rm -rf <root>`` pin; and every ``rm``-bearing
+#: sink literal in one interpreter payload is classified (the shared descent budget
+#: bounds only nested re-entry, not flat sibling classification), so a flood of
+#: benign siblings cannot starve a catastrophic sibling of the budget it needs. The
+#: flat-sibling count is already bounded by the payload scan cap, so the budget still
+#: bounds total work while a catastrophic sibling is always classified.
+_PACKAGE_LINE_BUDGET = 31_463
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
