@@ -181,6 +181,7 @@ DECLARED_SITES = frozenset(
         ("skills.py", "SkillsLoader.delete_skill"),
         ("skills.py", "_dispose_superseded_slot"),
         ("skills.py", "_ensure_builtin_skills"),
+        ("skills.py", "_iter_skill_files.probe"),
         ("skills.py", "_recorded_fingerprint"),
         ("skills.py", "_skill_currency_state"),
         ("skills.py", "_skill_tree_fingerprint"),

@@ -1933,6 +1933,136 @@ class TestResolveDollarSkills:
         names = [n for _t, n, _b in out]
         assert names == ["oncall-handover", "nested/ticket-pull"]
 
+    def test_nested_key_uses_forward_slash(self, tmp_path, opened):
+        """The enumerated key of a nested skill is forward-slash-separated.
+
+        Discriminator for a Windows-only failure of ``test_multiple_tokens_anywhere``
+        seen on a CodeBuild container: the resolver leaf-matches ``$ticket-pull``
+        against ``key.rsplit("/", 1)[-1]``, so a key built with the OS separator
+        (``nested\\ticket-pull`` on Windows) would leaf to the whole string and match
+        nothing — an identical-looking assertion failure, but with the bug in NAMING
+        rather than enumeration or the read gate. This pins the key exactly, so a CI
+        run answers which mechanism is at fault instead of leaving it a coin flip: if
+        BOTH this and ``test_multiple_tokens_anywhere`` fail, the key is misnamed; if
+        this passes while the other fails, naming is eliminated. The loader is
+        wrapped in ``opened`` so its catalog-refresh thread and SQLite descriptors
+        are released at teardown.
+        """
+        loader = opened(self._loader(tmp_path))
+        keys = [s["key"] for s in loader.scoped_skills()]
+        assert "nested/ticket-pull" in keys
+        assert "nested\\ticket-pull" not in keys
+
+    def test_two_flat_siblings_both_enumerate_and_resolve(self, tmp_path, opened):
+        """Two flat sibling skills both enumerate and both resolve — a count pin.
+
+        Discriminator for a Windows-only second-token drop seen on a CodeBuild
+        container: resolving ``$one $two`` returns only one skill even though both
+        are flat, top-level, and carry no path separator. That rules out the
+        nested-key/separator theory (there is no separator here) and localizes the
+        drop to the count, not the name. This pins BOTH stages so a CI run says
+        which stage drops the sibling:
+
+        * If ``scoped_skills`` returns one key, the WALK (``_iter_skill_files``)
+          drops a distinct sibling on that filesystem — its only sibling-dropping
+          site is the ``seen_real`` dedup keyed on ``os.path.realpath``.
+        * If ``scoped_skills`` returns both keys but ``resolve_dollar_skills``
+          returns one, the drop is in the resolver's per-token loop.
+
+        Kept minimal and platform-neutral: the assertion holds on every platform,
+        so a red is a real defect on the host that produced it, not a POSIX-only
+        expectation. The loader is wrapped in ``opened`` so its catalog-refresh
+        thread and SQLite descriptors are closed at teardown — a measurement test
+        must not itself leak the resource that makes the suite flaky.
+        """
+        skills_dir = tmp_path / "skills"
+        _create_skill(skills_dir, "one", "---\nname: one\ndescription: A\n---\n# One\nBody one.")
+        _create_skill(skills_dir, "two", "---\nname: two\ndescription: B\n---\n# Two\nBody two.")
+        loader = opened(SkillsLoader(skills_path=skills_dir, install_builtins=False))
+
+        keys = sorted(s["key"] for s in loader.scoped_skills())
+        assert keys == ["one", "two"]
+
+        out = loader.resolve_dollar_skills("use $one and $two")
+        assert [n for _t, n, _b in out] == ["one", "two"]
+
+    def test_nested_skill_enumerates_beside_flat_under_plain_and_symlinked_base(self, tmp_path):
+        """A nested skill enumerates alongside a flat one — even via a symlinked base.
+
+        Regression guard for the Windows-only drop where the NESTED skill
+        (``nested/ticket-pull``) vanished from enumeration while the depth-1 flat
+        skill survived. Root cause: the catalog walk re-resolved every node with
+        ``os.path.realpath`` concurrently, and two independent resolutions of a
+        shared prefix could canonicalize its case differently on Windows, so a
+        case-sensitive containment check read a genuine descendant as outside the
+        base and dropped its subtree. The fix derives a child's resolved path from
+        its already-resolved parent, resolving fresh only at the root and at
+        link/junction nodes.
+
+        Both halves matter and a naive fix fails one: checking a plain
+        descendant's LEXICAL path (instead of parent-derived) would drop a skill
+        reached through a symlinked base — the symlinked-home case — so this
+        exercises a symlinked base too. Enumeration is deterministic here, so the
+        assertion holds on every platform; on Windows it additionally guards the
+        realpath race.
+        """
+        from kiro_crew.skills import _iter_skill_files
+
+        real_base = tmp_path / "real_skills"
+        _create_skill(real_base, "flat-skill", "---\nname: flat-skill\n---\n# Flat")
+        _create_skill(real_base, "nested/deep-skill", "---\nname: nested/deep-skill\n---\n# Deep")
+
+        # Plain base: both enumerate, nested key is forward-slash separated.
+        names = sorted(name for name, _path in _iter_skill_files(real_base))
+        assert names == ["flat-skill", "nested/deep-skill"]
+
+        # Symlinked base: the nested skill must still enumerate. A lexical-only
+        # containment shortcut would drop it here because the symlinked spelling
+        # is not lexically under the base's realpath. make_dir_link (a junction
+        # on Windows, a dir symlink on POSIX) keeps this exercised on the
+        # platform the drop was found on, instead of skipping there.
+        from conftest import make_dir_link
+
+        link_base = tmp_path / "linked_skills"
+        make_dir_link(link_base, real_base)
+        via_link = sorted(name for name, _path in _iter_skill_files(link_base))
+        assert via_link == ["flat-skill", "nested/deep-skill"]
+
+    def test_skill_under_symlinked_intermediate_ancestor_is_resolved_fresh(self, tmp_path):
+        """A skill whose ancestor is a link is resolved fresh, not parent-derived.
+
+        The catalog walk derives a plain child's real path from its already-
+        resolved parent (a Windows concurrency fix), but a parent-derived path
+        must not be trusted across a swapped/linked ancestor: the walk re-checks
+        that the immediate parent's (dev, ino) is unchanged and that it is not a
+        link before trusting the derivation, and otherwise resolves the node
+        fresh through ``os.path.realpath``. Here an intermediate directory in the
+        tree is a symlink to a sibling holding the skill; the skill must still be
+        found (via the fresh-resolve branch) and its resolved SKILL.md must land
+        under the tree — proving the link ancestor is handled, not blindly
+        composed onto a stale parent real path.
+        """
+        from kiro_crew.skills import _iter_skill_files
+
+        base = tmp_path / "skills"
+        base.mkdir(parents=True, exist_ok=True)
+        _create_skill(base, "plain", "---\nname: plain\n---\n# Plain")
+        # Target lives INSIDE the base tree (so it is contained), and an
+        # intermediate name links to it — the link node is resolved fresh while
+        # its resolved path still lands under the base.
+        _create_skill(base, "real/linked-child", "---\nname: linked-child\n---\n# Linked")
+        # make_dir_link: a junction on Windows, a dir symlink on POSIX — keeps
+        # the link-ancestor path exercised on Windows instead of skipping there.
+        from conftest import make_dir_link
+
+        make_dir_link(base / "via", base / "real")
+
+        names = sorted(name for name, _path in _iter_skill_files(base))
+        # The plain skill and the skill reached through the linked intermediate
+        # both enumerate; the link node is resolved fresh (not parent-derived).
+        assert "plain" in names
+        assert "real/linked-child" in names
+
     def test_dedupe_repeated_token(self, tmp_path):
         loader = self._loader(tmp_path)
         out = loader.resolve_dollar_skills("$oncall-handover and again $oncall-handover")

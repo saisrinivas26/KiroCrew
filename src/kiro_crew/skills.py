@@ -1089,11 +1089,97 @@ def _iter_skill_files(
         return []
     allowed_roots = (os.path.realpath(base),) + _trusted_skill_roots()
 
-    def probe(directory: Path) -> tuple[str | None, list[Path], Path | None]:
+    def _identity(path: Path) -> tuple[int, int] | None:
+        """``(st_dev, st_ino)`` of *path* without following a final link, or None."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def probe(
+        directory: Path,
+        parent_real: str | None,
+        parent_identity: tuple[int, int] | None,
+    ) -> tuple[str | None, list[tuple[Path, str, tuple[int, int] | None]], Path | None]:
         lexical = os.path.abspath(directory)
         if exclude_roots and _within_any(lexical, exclude_roots):
             return lexical, [], None
-        real = os.path.realpath(directory)
+        # Resolve the node's real path from its ALREADY-RESOLVED parent instead
+        # of re-resolving the whole chain from scratch. The walk probes nodes
+        # CONCURRENTLY (ThreadPoolExecutor) and formerly re-resolved every node
+        # with os.path.realpath, which consults the filesystem to canonicalize
+        # case and 8.3 short names on Windows. Deriving child real =
+        # parent_real / name resolves each shared prefix exactly once, so no two
+        # concurrent realpath() calls on the same prefix can disagree about it.
+        # This is a strict-safe correctness change — containment still compares
+        # resolved paths via _within_any (which folds case on WindowsPath, so it
+        # is NOT the case-sensitive check an earlier draft of this comment
+        # claimed), and the derivation cannot read a genuine descendant as
+        # outside base. The exact mechanism of the observed Windows-only drop
+        # (nested skill dropped, depth-1 flat skill survived; job 109800815266)
+        # remains a hypothesis — a concurrent-realpath disagreement on the
+        # shared prefix is the leading candidate but is not reproduced here; the
+        # green Windows CI shards on this head are the evidence the fix does not
+        # regress, and the parent-derived resolution removes the candidate race
+        # whether or not it was the cause.
+        #
+        # Parent-derived trust is guarded: `parent_identity` is the (dev, ino)
+        # of the directory as it was when it enqueued this child. Before
+        # trusting `parent_real`, re-verify the immediate parent — and the ORDER
+        # of the two sub-checks is load-bearing: capture the parent's current
+        # identity FIRST, THEN test its link status, and trust the derivation
+        # only if the just-captured identity equals the recorded `parent_identity`
+        # AND the parent is not a link/junction. Testing link status first and
+        # comparing identity second leaves a window where a plain dir passes the
+        # link test and is then swapped for a link before identity is read; by
+        # reading identity first and requiring it unchanged, a swap in either
+        # order changes `(dev, ino)` and fails the check. On any mismatch (or if
+        # identity cannot be read) the node is resolved FRESH through realpath —
+        # authoritative, re-runs full containment. The root, and any node that
+        # is itself a link/junction (targets live elsewhere — an app symlinks
+        # its skills in), always resolve fresh. Identity on POSIX; no case
+        # folding, no stat through a plain directory.
+        parent_now = _identity(directory.parent)
+        # This node's identity, captured BEFORE the link screen and the
+        # containment decision below so those checks and the post-scan recheck
+        # all judge the SAME object. Capturing it after them would let a
+        # dir->link swap that happens between the containment decision and the
+        # capture be recorded as the post-swap identity — the recheck would then
+        # compare the scanned content against an already-swapped baseline and
+        # admit it. lstat, not stat: identity of the node itself, not its target.
+        my_identity = _identity(directory)
+        # Re-establish the parent-trust decision AFTER this node's identity is
+        # captured, so the two are consistent to the same instant: a swap of the
+        # parent between the first `parent_now` read and the `my_identity`
+        # capture would otherwise leave a stale `parent_ok` deciding whether we
+        # trust a derived path for a node whose own identity was read afterwards.
+        # Re-read identity FIRST, THEN link status (the load-bearing order), and
+        # require both unchanged from what the parent enqueued.
+        parent_recheck = _identity(directory.parent)
+        # The derived path is composed onto `parent_real` (the parent's RESOLVED
+        # anchor), not onto `directory.parent` (its lexical spelling), so the
+        # anchor itself must still identify the object we recorded. Verifying
+        # only `directory.parent` leaves `parent_real` unbound: if it names a
+        # different object now — its target swapped, or the lexical and resolved
+        # parents diverged — a derived `parent_real / name` would land under an
+        # anchor we never re-vetted. Require `parent_real` to still resolve to
+        # `parent_identity`; otherwise the anchor is untrusted and the node is
+        # resolved fresh.
+        parent_real_now = _identity(Path(parent_real)) if parent_real is not None else None
+        parent_ok = (
+            parent_real is not None
+            and parent_identity is not None
+            and parent_now == parent_identity
+            and parent_recheck == parent_identity
+            and parent_real_now == parent_identity
+            and not is_link_or_junction(directory.parent)
+        )
+        directory_is_link = is_link_or_junction(directory)
+        if parent_real is None or not parent_ok or directory_is_link:
+            real = os.path.realpath(directory)
+        else:
+            real = os.path.join(parent_real, directory.name)
         if exclude_roots and _within_any(real, exclude_roots):
             return real, [], None
         if not _within_any(real, allowed_roots) or is_sensitive_resolved_path(real):
@@ -1105,7 +1191,7 @@ def _iter_skill_files(
             # A failed alias has not visited its target. Another spelling may
             # still enumerate it successfully, as with os.walk's error handling.
             return None, [], None
-        children = []
+        children: list[tuple[Path, str, tuple[int, int] | None]] = []
         has_skill = False
         for entry in entries:
             if exclude_roots and _within_any(os.path.abspath(entry.path), exclude_roots):
@@ -1115,14 +1201,44 @@ def _iter_skill_files(
             except OSError:
                 is_dir = False
             if is_dir and not entry.name.startswith("."):
-                children.append(directory / entry.name)
+                children.append((directory / entry.name, real, my_identity))
             elif not is_dir and entry.name == "SKILL.md":
                 has_skill = True
-        children.sort(key=lambda path: path.name)
+        children.sort(key=lambda item: item[0].name)
         skill_file = directory / "SKILL.md"
         if not has_skill:
             return real, children, None
-        real_file = os.path.realpath(skill_file)
+        # A SKILL.md that is itself a link resolves fresh (its target may live
+        # outside the tree); a plain file's real path is its resolved parent
+        # joined with the filename — no fresh realpath, same race-free reason.
+        #
+        # EXCEPT when the directory's own identity is no longer the object we
+        # scanned, or it has become a link/junction. `directory_is_link` and
+        # `real` are SNAPSHOTS taken before `scandir`; the only identity
+        # rechecks fired BEFORE enumeration. A plain directory swapped to an
+        # out-of-root symlink DURING the scan leaves `directory_is_link` false
+        # and `real` stale, and a plain `SKILL.md` left at the swapped target
+        # passes the `is_link_or_junction(skill_file)` screen below — so
+        # composing `real / SKILL.md` onto the stale anchor would route the new
+        # target's file past containment. Recheck the live directory identity
+        # (lstat) and link status against `my_identity` here, immediately before
+        # composing: on any mismatch, or a directory that is now a link, or a
+        # linked SKILL.md, resolve the live path afresh (authoritative realpath)
+        # so the containment/sensitivity checks below judge the real target, not
+        # a snapshot anchor. The agent that can write the skills tree can retry
+        # the swap on every catalog walk, so this must be a live recheck, not a
+        # one-shot pre-scan read.
+        directory_now = _identity(directory)
+        directory_moved = directory_now != my_identity
+        if (
+            directory_is_link
+            or directory_moved
+            or is_link_or_junction(directory)
+            or is_link_or_junction(skill_file)
+        ):
+            real_file = os.path.realpath(skill_file)
+        else:
+            real_file = os.path.join(real, _SKILL_FILE)
         if exclude_roots and _within_any(real_file, exclude_roots):
             return real, children, None
         if not _within_any(real_file, allowed_roots) or is_sensitive_resolved_path(real_file):
@@ -1133,20 +1249,26 @@ def _iter_skill_files(
     seen_real: set[str] = set()
     # Commit probes in sorted depth-first order, irrespective of completion
     # order, so links sharing a target keep the same canonical skill key.
-    stack = [base]
-    pending: dict[Path, Future[tuple[str | None, list[Path], Path | None]]] = {}
+    stack: list[tuple[Path, str | None, tuple[int, int] | None]] = [(base, None, None)]
+    pending: dict[
+        Path, Future[tuple[str | None, list[tuple[Path, str, tuple[int, int] | None]], Path | None]]
+    ] = {}
     with ThreadPoolExecutor(
         max_workers=_CATALOG_READ_WORKERS, thread_name_prefix="skill-walk"
     ) as pool:
         while stack:
-            for directory in reversed(stack):
+            for directory, parent_real, parent_identity in reversed(stack):
                 if len(pending) >= _CATALOG_READ_BATCH:
                     break
                 if directory not in pending:
-                    pending[directory] = pool.submit(copy_context().run, probe, directory)
-            directory = stack.pop()
+                    pending[directory] = pool.submit(
+                        copy_context().run, probe, directory, parent_real, parent_identity
+                    )
+            directory, parent_real, parent_identity = stack.pop()
             future = pending.pop(directory, None)
-            real, children, discovered_file = future.result() if future else probe(directory)
+            real, children, discovered_file = (
+                future.result() if future else probe(directory, parent_real, parent_identity)
+            )
             if real is None or real in seen_real:
                 continue
             seen_real.add(real)
