@@ -1021,9 +1021,12 @@ class TestProjectFilesDenialAttribution:
 # Forwarding helpers are pinned as forwarding rather than forced to use a fixed
 # literal that would erase the caller's attribution.
 _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
-    # One read: the launch loop reads each authored spec to project it. Alias
-    # reclaim is keyed on lease liveness and reads no authored source.
+    # Two reads: the launch loop reads each authored spec to project it, and the
+    # positive-verification pass re-reads each candidate list_agents dropped (a
+    # refused inode, or a readable dedup-loser twin) to refuse or map its stem.
+    # Alias reclaim is keyed on lease liveness and reads no authored source.
     "kiro_crew/acp/skill_projection.py": [
+        ("native_skill_projection", "acp"),
         ("native_skill_projection", "acp"),
     ],
     # Two reads, deliberately labelled apart: the session-MCP translation resolves
@@ -1351,6 +1354,10 @@ _EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("forward:operation", "forward:source"),
         ("list_agents", "unknown"),
     ],
+    # The native-skill projection's positive-verification pass takes NO scope
+    # verdict of its own: it reuses the single decision ``list_agents`` already
+    # took (the project dirs it admitted), so there is no ``_project_scope_denied``
+    # call site here to pin.
 }
 
 

@@ -31,12 +31,16 @@ from typing import Any
 
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.acp import session_mcp
-from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agents
-from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.agent_discovery import (
+    SCOPE_PROJECT,
+    _read_agent_spec,
+    list_agents,
+)
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, iter_agent_spec_files
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
-from kiro_crew.security import _PATH_RESOLVE_TIMEOUT_SECS
+from kiro_crew.security import _PATH_RESOLVE_TIMEOUT_SECS, is_sensitive_path
 from kiro_crew.validation import is_registered_agent_name
 from kiro_crew.workspace_cli_settings import workspace_cli_settings_lock
 
@@ -82,6 +86,24 @@ _PROJECTION_LEASE_SCAN_MAX_SECONDS = 0.4
 # here rather than recomputed from the writer, because widening the writer must
 # not silently widen what the reclaim is willing to delete.
 _LEGACY_ALIAS_NAME_RE = re.compile(re.escape(NATIVE_SKILL_ALIAS_PREFIX) + r"[0-9a-f]{24}")
+# One shared ceiling over every per-spec identity map this preparation retains
+# (aliases, specs, sources, errors, stems, display_sizes). The agents directory
+# is operator-and-package-writable, so without a population bound a directory of
+# N specs grows these maps with N externally controlled names/stems unboundedly,
+# and the re-walk below adds a second population from the same directory. The cap
+# counts DISTINCT projected agents admitted; once reached, further specs are
+# dropped and the overflow is logged ONCE (not per spec). Sized well above any
+# real agents directory and at the lease ceiling, so a legitimate install never
+# trips it. Per-string growth is bounded independently by _MAX_IDENTITY_NAME_LEN.
+# The runtime's own ever-projected set (runtime.py) imports BOTH of these so the
+# whole population is bounded by one named ceiling, not an alias-recognition one.
+_PROJECTION_IDENTITY_MAX = _PROJECTION_LEASE_MAX_ALIASES
+# The longest name or filename stem admitted into an identity map. A name longer
+# than this is not one this projection or any registered writer produces, so it
+# is a malformed/externally injected string that must not be retained verbatim;
+# the spec is refused by its (bounded) name instead. kiro-cli agent names are
+# short identifiers; this is generous headroom over them.
+_MAX_IDENTITY_NAME_LEN = 256
 # Candidate work is bounded independently of successful reclamation. Retained
 # aliases must not turn a prune under the publication lock into an unbounded scan.
 # It is the unit of the ENUMERATION ceiling, the part of the section the time
@@ -459,6 +481,39 @@ class NativeSkillProjection:
     specs: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     search_agents: set[str] = field(default_factory=set)
+    #: Every filename STEM the backend can resolve to a projected agent, mapped to
+    #: that agent's canonical name. kiro-cli addresses an agent by its spec's
+    #: filename stem as well as its authored ``name``, and the two can differ, so
+    #: a stem is a second backend-resolvable identity for the same spec. Recording
+    #: it lets :meth:`agent` map or refuse a stem exactly as it would the name --
+    #: otherwise a mode/spawn addressing the stem would slip past the alias and
+    #: error maps (both keyed on the name) and reach the cached spec untranslated,
+    #: which is the refusal the projection exists to enforce being bypassed.
+    stems: dict[str, str] = field(default_factory=dict)
+    #: The agent a DIRECT CLIENT (one process / one session) was launched as,
+    #: recorded by that spawn caller after preparation. The process is already
+    #: running as it, so its first ``session/set_mode`` activation must be
+    #: tolerated even with no prepared view -- refusing it would strand a valid
+    #: startup. ``request()`` tolerates that FIRST activation and then clears this,
+    #: so a later mid-session switch back to the launch agent takes the strict
+    #: resolver and fails closed if its view has vanished. ``frame`` keeps the
+    #: launched agent's mode in projected ``availableModes`` while this is set, so
+    #: the start -- which reads ``availableModes`` before sending ``set_mode`` --
+    #: finds an activatable mode. The SHARED RUNTIME does NOT set this: it activates
+    #: the launched agent through ``_activate_mode_bracketed``, which allows
+    #: ``self._agent`` at every session start explicitly, and setting this would
+    #: make ``request()`` tolerate the launch agent on a mid-session switch too,
+    #: reactivating a cached unprojected spec. Every OTHER modeId is strict. Empty
+    #: until set, which keeps the strict answer for a projection no spawn claimed.
+    spawn_agent_name: str = ""
+    #: True when ``prepare_native_skill_projection`` hit the shared identity cap:
+    #: at least one on-disk spec was dropped unrecorded, so an unknown name/stem
+    #: MIGHT be one of those dropped specs. ``spawn_agent`` then fails CLOSED on any
+    #: unknown identity rather than passing it through to a raw unprojected load --
+    #: the cap must never become a fail-open bypass. The launch identity
+    #: (``spawn_agent_name``) is exempt: it is retained before the cap and always
+    #: resolves.
+    identity_cap_reached: bool = False
     _lease_finalizer: Any = field(default=None, repr=False, compare=False)
     # Aliases an EARLIER projection of this process published, alias -> agent. The
     # host may still hold them (every alias it loaded at spawn, say), so inbound
@@ -510,15 +565,97 @@ class NativeSkillProjection:
             if source is None:
                 raise RetiredSkillView(name)
             name = source
+        # A spec is addressable by its filename stem as well as its authored name,
+        # and the two can differ. Resolve a stem to the canonical name FIRST, so a
+        # stem-addressed spec is mapped to its alias or refused by its error entry
+        # exactly as its name would be -- never passed through untranslated, which
+        # would bypass the projection's refusal for that spec.
+        if name not in self.aliases and name not in self.errors and name in self.stems:
+            name = self.stems[name]
         if name not in self.aliases:
             if name in self.errors:
                 raise ValueError(f"Agent {name!r}: {self.errors[name]}")
             raise ValueError(f"Agent {name!r} has no prepared skill discovery view")
         return self.aliases[name]
 
+    def launch_identity_name(self, name: str) -> str:
+        """Return the DECLARED name a launch identity is advertised under.
+
+        A process is launched under its ``--agent`` identity, which may be a
+        filename STEM that differs from the spec's declared ``name`` (the only
+        case ``stems`` is populated). :meth:`frame` rewrites the host's
+        advertised mode ids to each agent's declared name, so the direct
+        client's start-mode membership test must compare that declared name,
+        not the raw stem. Resolve a stem to its declared name here; a declared
+        name, or a stem with no projected view, resolves to itself so the test
+        is unchanged for every ordinary launch. Unlike :meth:`agent` this never
+        raises and never returns an alias -- it answers "what name does the
+        host advertise this launch identity under", for a membership check only.
+        """
+        if name not in self.aliases and name not in self.errors and name in self.stems:
+            return self.stems[name]
+        return name
+
+    def spawn_agent(self, name: str) -> str:
+        """Resolve the ``--agent`` transport name for a spawn, tolerating no view.
+
+        The strict :meth:`agent` guards ``session/set_mode``: a mid-session
+        switch to a mode this projection never prepared must be rejected, so an
+        agent cannot escape the scope it was launched under. Spawn selection asks
+        a softer question. An agent whose spec an authored restriction refused --
+        a ``kirocrew-core`` exclusion, a disabled ``skill_search`` -- is a
+        user-facing spawn refusal that still raises (the callers wrap it as
+        ``AcpRuntimeError`` and the startup paths translate the sentence). An
+        agent that simply has no prepared view -- its spec is not among the
+        projected agents, as in a work_dir that carries no such spec -- keeps its
+        authored transport name, the same answer a ``None`` projection gives: the
+        agent spawns under its own name rather than aborting an otherwise valid
+        spawn over a skill view it never asked for.
+        """
+        if (
+            is_skill_view_name(name)
+            or name in self.aliases
+            or name in self.errors
+            or name in self.stems
+        ):
+            return self.agent(name)
+        # The identity cap was reached during preparation, so at least one on-disk
+        # spec was dropped UNRECORDED -- this unknown name might be one of them, and
+        # passing it through would let kiro-cli load that raw spec with none of the
+        # projection's hardening (a fail-OPEN cap bypass). Fail closed instead. The
+        # launch identity gets NO exemption here: preparation takes no launch-identity
+        # argument, so ``spawn_agent_name`` (set by the client only after this
+        # projection is built) is admitted on iteration order alone -- a past-cap
+        # launch name is exactly the dropped-unrecorded case, so exempting it would
+        # reopen the bypass for the one identity most likely to be spawned.
+        if self.identity_cap_reached:
+            raise ValueError(
+                f"Agent {name!r}: the skill-projection identity cap was reached, so this "
+                "spawn identity could not be verified against a projected spec; it is refused "
+                "rather than launched unprojected. Reduce the number of agent specs in scope."
+            )
+        return name
+
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "session/set_mode":
-            return {**params, "modeId": self.agent(str(params.get("modeId", "")))}
+            mode_id = str(params.get("modeId", ""))
+            # The launched agent's own activation is tolerated even with no
+            # prepared view: the process is already running as it, so the initial
+            # ``set_mode`` that activates it must not be refused. ``spawn_agent``
+            # gives that name back unchanged; every other modeId takes the strict
+            # ``agent``, so a mid-session switch to a mode this projection never
+            # prepared is still rejected and an agent cannot escape its scope.
+            tolerated = bool(mode_id) and mode_id == self.spawn_agent_name
+            resolve = self.spawn_agent if tolerated else self.agent
+            translated = {**params, "modeId": resolve(mode_id)}
+            if tolerated:
+                # CONSUME the exemption once spent: it covers only the launched
+                # agent's FIRST activation. Cleared, a later set_mode back to the
+                # same agent takes the strict ``agent`` again -- so a view that has
+                # since vanished fails closed instead of reactivating a cached spec
+                # the strict resolver existed to refuse.
+                self.spawn_agent_name = ""
+            return translated
         if method == "_kiro.dev/commands/execute":
             command = params.get("command", "")
             if isinstance(command, dict):
@@ -557,6 +694,16 @@ class NativeSkillProjection:
                         mode_id = item.get("id")
                         name = reverse.get(mode_id) if isinstance(mode_id, str) else None
                         if name is None and mode_id in self.aliases:
+                            name = mode_id
+                        # The launched agent's own mode stays listed while its
+                        # exemption is unconsumed, even with no prepared view: the
+                        # initial set_mode request() tolerates it (keyed on the same
+                        # spawn_agent_name), so dropping it from availableModes would
+                        # advertise no mode the process could activate and fail the
+                        # direct-client start during initialization. Once the
+                        # exemption is consumed spawn_agent_name is "", so this
+                        # stops matching and an unprojected agent is hidden again.
+                        if name is None and bool(mode_id) and mode_id == self.spawn_agent_name:
                             name = mode_id
                         if name is None or name in listed:
                             continue
@@ -2525,6 +2672,62 @@ def prepare_native_skill_projection(
     errors: dict[str, str] = {}
     search_agents: set[str] = set()
     display_sizes: dict[str, tuple[int, str]] = {}
+    stems: dict[str, str] = {}
+    # One shared population bound over every identity map above. ``admitted`` is
+    # the set of DISTINCT identities (agent names and filename stems) this
+    # preparation has retained; ``_admit`` is the single gate every store write
+    # goes through. It refuses an over-long name (externally injected, not one a
+    # writer produces) and, once the shared ceiling is reached, refuses further
+    # NEW identities so the maps cannot grow without bound on an operator- or
+    # package-writable directory. An identity already admitted is always allowed
+    # back (so the two populations -- the main loop and the re-walk -- never
+    # double-count, and re-registering a known stem is free). The overflow is
+    # COUNTED into ``dropped_count`` and reported once per preparation (not per
+    # dropped spec, and not merely as the ceiling) -- a bound names how many
+    # fields it could not retain. The counter alone would double-count a stem the
+    # main loop and the re-walk both refuse, so ``dropped_seen`` dedups the two
+    # passes -- but it is itself a RETAINED collection, so it is bounded by
+    # ``_PROJECTION_IDENTITY_MAX``: once that many distinct refusals have been
+    # recorded, dedup stops and further refusals increment the counter directly
+    # (the count can then slightly OVER-report on a pathological directory, which
+    # is the safe direction for an advisory overflow number -- it never grows the
+    # retained set past the same cap the admitted population obeys). The single
+    # counted line is emitted once both admission passes are done (just below the
+    # re-walk). The fail-closed latch keys off ``dropped_count``, not the set.
+    admitted: set[str] = set()
+    dropped_seen: set[str] = set()
+    dropped_count = 0
+
+    def _admit(name: str) -> bool:
+        nonlocal dropped_count
+        if not isinstance(name, str) or not name or len(name) > _MAX_IDENTITY_NAME_LEN:
+            return False
+        if name in admitted:
+            return True
+        if len(admitted) >= _PROJECTION_IDENTITY_MAX:
+            if name in dropped_seen:
+                return False
+            if len(dropped_seen) < _PROJECTION_IDENTITY_MAX:
+                dropped_seen.add(name)
+            dropped_count += 1
+            return False
+        admitted.add(name)
+        return True
+
+    # The project agents directory the re-walk below must cover, decided ONCE in
+    # this frame, before any read under it -- the same contract list_agents keeps
+    # for its own scan. It must NOT be derived from the rows list_agents yielded:
+    # a project scope whose only spec the reader refuses yields no row at all, so a
+    # yielded-rows heuristic would leave project_scan_dirs empty and the backstop
+    # would skip the project dir -- letting that one dropped stem pass through to a
+    # raw unprojected load (the fail-OPEN this backstop exists to close). The
+    # admission question (is this scope sensitive?) is the SAME predicate
+    # list_agents took; taking it here before any filesystem access under the tree
+    # keeps the one-decision-before-read guarantee, and a divergent answer only
+    # ever drops the scope more, never reads a tree a denial was recorded for.
+    project_scan_dirs: set[Path] = set()
+    if work_dir and not is_sensitive_path(str(work_dir)):
+        project_scan_dirs.add(project_agents_dir(str(work_dir)))
     for agent in list_agents(project_dir=str(work_dir)):
         if not agent.filename:
             continue
@@ -2532,9 +2735,41 @@ def prepare_native_skill_projection(
             project_agents_dir(str(work_dir)) if agent.scope == SCOPE_PROJECT else directory
         )
         source = source_dir / agent.filename
+        stem = Path(agent.filename).stem
+        # One gate before any identity store is written for this spec: an
+        # over-long name or a directory already at the shared cap drops the spec
+        # (overflow logged once by _admit). A dropped spec is simply not
+        # projected -- it is not recorded in errors either, since recording it
+        # would itself be unbounded growth; the cap is the bound of last resort
+        # above any real install.
+        if not _admit(agent.name):
+            continue
         spec = _read_agent_spec(source, operation="native_skill_projection", source="acp")
         if spec is None:
+            # The spec FILE exists -- list_agents enumerated it -- but could not be
+            # read (a hardlink/symlink the trusted-root gate refuses, a parse
+            # failure, a size cap). Refusing it is mandatory: passing its name
+            # through would let kiro-cli activate the on-disk spec with NONE of the
+            # projection's hardening, the exact bypass the strict resolver exists
+            # to close. Record the refusal under BOTH the name and the stem so
+            # neither identity reaches the pass-through, and keep going so one
+            # unreadable spec never aborts preparation of the healthy ones.
+            errors[agent.name] = (
+                "its spec could not be read (unreadable, unparseable, or oversized), "
+                "so no verified skill view could be prepared"
+            )
+            if stem and stem != agent.name and _admit(stem):
+                stems[stem] = agent.name
             continue
+        # Register the stem the MOMENT the spec is readable, before any validation
+        # continue below. A spec's filename stem is a second identity the backend
+        # resolves to this same agent; recording it here (unless it already IS the
+        # name) means agent() maps or refuses a stem-addressed spec exactly as its
+        # name -- including a spec that a validation branch below refuses into
+        # ``errors`` and skips, which must stay refused when reached by its stem,
+        # not pass through untranslated.
+        if stem and stem != agent.name and _admit(stem):
+            stems[stem] = agent.name
         display_sizes[agent.name] = (_display_text_bytes(spec), source.absolute().as_posix())
         view = copy.deepcopy(spec)
         _strip_alias_display_text(view)
@@ -2638,7 +2873,129 @@ def prepare_native_skill_projection(
         specs[agent.name] = view
         sources[agent.name] = source.absolute().as_posix()
 
+    # list_agents() enumerates every candidate but does not surface every one as a
+    # projected identity. One drop leaves a backend-resolvable stem with no entry
+    # in specs, errors or stems that is a genuine hardening bypass, so spawn_agent()
+    # would hand that stem straight back and let kiro-cli load the raw on-disk spec
+    # with none of this projection's hardening:
+    #
+    #   A spec the reader REFUSES -- a hardlink or non-regular inode the
+    #   trusted-root gate rejects, a fenced/sensitive target, an oversized or
+    #   unparseable file -- never reaches the build loop above, so it is in no
+    #   map, yet the backend resolves ``--agent <stem>`` to that same inode. Fail
+    #   closed under its stem.
+    #
+    # A READABLE candidate list_agents dropped (a dedup-loser of a cross-package
+    # same-name collision, or a spec past the identity cap) is also in no map, yet
+    # the backend resolves ``--agent <stem>`` to its on-disk inode and would load
+    # the raw spec with none of this projection's hardening. It is REFUSED under
+    # its own stem too (message names the file and why it was dropped): it is NOT
+    # re-mapped onto whichever row survived dedup -- aliasing its stem onto another
+    # package's hardened view and tool policy is a wrong-agent hazard worse than
+    # the leak -- and NOT left to pass through, which is the raw-load bypass. The
+    # collision is already surfaced at discovery (agent_discovery.py). Only a name
+    # with NO matching on-disk spec stays absent from every map and passes through.
+    #
+    # Re-walk the SAME scope-decided directories list_agents read, through the SAME
+    # guarded reader. Scoped to ``.json`` candidates on purpose: a ``.json`` file
+    # is unambiguously spec-shaped, so a reader refusal is a genuine dropped spec
+    # and a readable one declares a resolvable name. A ``.md`` entry is not -- a
+    # plain fenceless markdown document is a legitimate non-spec the reader also
+    # returns ``None`` for, so refusing every unreadable ``.md`` would fail closed
+    # on an ordinary note (the over-blocking that turns a valid no-view spawn into
+    # "cannot start"); a fenced ``.md`` spec at a refused inode cannot be
+    # fence-checked without reading the very inode the gate refuses, so it is left
+    # to the discovery backstop (the backend cannot read that inode either).
+    # The user directory is always scanned; the project scope is added when the
+    # scope was ADMITTED (``project_scan_dirs``, seeded from the one verdict taken
+    # above before any read), independent of whether list_agents yielded any
+    # project row -- an admitted project dir whose only spec the reader refused
+    # yields no row yet must still be re-walked, or that dropped stem passes
+    # through. ``dict.fromkeys`` keeps ``directory`` first and de-dupes the (at
+    # most one) project dir.
+    scan_dirs: list[Path] = list(dict.fromkeys([directory, *sorted(project_scan_dirs)]))
+    for scan_dir in scan_dirs:
+        try:
+            if not scan_dir.is_dir():
+                continue
+            candidates = iter_agent_spec_files(scan_dir)
+        except OSError:
+            # A directory the walk itself cannot read contributes no candidates;
+            # a spec hidden behind an unreadable directory is unreachable by the
+            # backend too, so there is nothing to refuse.
+            continue
+        for candidate in candidates:
+            if candidate.suffix.lower() != ".json":
+                continue
+            candidate_stem = candidate.stem
+            # ``specs``, not ``aliases``: the alias strings are assigned later
+            # under the alias lock, so ``aliases`` is still empty here and testing
+            # it would re-read every already-projected ``.json`` spec a second
+            # time on every preparation (i.e. every session start). ``specs`` is
+            # the record of what the main loop projected; ``stems``/``errors``
+            # cover the stem/refusal identities it already recorded.
+            if candidate_stem in specs or candidate_stem in errors or candidate_stem in stems:
+                continue
+            candidate_spec = _read_agent_spec(
+                candidate, operation="native_skill_projection", source="acp"
+            )
+            if candidate_spec is None:
+                # A ``.json`` spec the reader REFUSES (a hardlink/non-regular
+                # inode the trusted-root gate rejects, a fenced/sensitive target,
+                # an oversized or unparseable file) never reached the build loop,
+                # so its stem is in no map and spawn_agent() would hand it straight
+                # back for an unprojected backend load. Fail closed under its stem
+                # (bounded by the shared cap like every other identity). If the cap
+                # is already full the write is skipped, but the projection's
+                # ``identity_cap_reached`` latch then makes spawn_agent() refuse
+                # EVERY unknown identity, so a past-cap drop still fails closed.
+                if _admit(candidate_stem):
+                    errors[candidate_stem] = (
+                        "its spec could not be read (unreadable, unparseable, or oversized), "
+                        "so no verified skill view could be prepared"
+                    )
+                continue
+            # A READABLE ``.json`` candidate list_agents DROPPED -- a dedup-loser
+            # twin of a cross-package same-name collision, or a spec past the
+            # identity cap -- is on disk but never projected, so its stem is in no
+            # map and spawn_agent() would hand it straight back for a raw,
+            # unprojected backend load (the bypass this re-walk closes). It is NOT
+            # re-mapped onto the surviving row: routing its stem onto whichever row
+            # won dedup would alias one package's stem onto a DIFFERENT package's
+            # hardened view and tool policy -- the wrong-agent hazard. Instead it is
+            # REFUSED under its own stem with a message naming the file and why it
+            # was dropped, so a spawn addressing that stem fails closed with a clear
+            # error rather than loading the raw spec. Only a name with NO matching
+            # on-disk spec stays absent from every map and passes through as a bare
+            # stem. Bounded by the shared cap like every other identity.
+            if _admit(candidate_stem):
+                errors[candidate_stem] = (
+                    f"its spec file {candidate.name} was omitted from skill projection "
+                    "(a same-name collision resolved to another spec, or the identity cap "
+                    "was reached), so no verified skill view could be prepared for it"
+                )
+
     _warn_on_display_text(display_sizes)
+    # Both admission passes (the main loop and the re-walk above) are now done, so
+    # ``dropped_count`` holds how many distinct identities the shared cap refused
+    # (deduped up to the cap by ``dropped_seen``; see ``_admit``). Report the
+    # overflow ONCE here, with the COUNT -- a bound that silently discards part of
+    # its input must say how much it discarded, not merely that a ceiling exists.
+    # Emitted on every return path below (including the lock-contention fallbacks),
+    # so the count is never lost to an early return. The fail-closed latch is
+    # ``dropped_count > 0``: if the cap refused anything, ``spawn_agent`` must
+    # refuse an unknown name rather than launch it unprojected (see
+    # ``identity_cap_reached``).
+    if dropped_count:
+        logger.warning(
+            "skill projection: identity cap of %d reached; %d distinct spec identit%s in %s "
+            "%s not projected this preparation",
+            _PROJECTION_IDENTITY_MAX,
+            dropped_count,
+            "y" if dropped_count == 1 else "ies",
+            directory,
+            "was" if dropped_count == 1 else "were",
+        )
     try:
         alias_lock = _projection_alias_lock(directory)
     except OSError as exc:
@@ -2765,7 +3122,14 @@ def prepare_native_skill_projection(
                     local[_INHERIT_SOURCE] = preference_source
                     local[_INHERIT_SETTING] = True
                     atomic_write(locked_settings, json.dumps(local, indent=2))
-                    prepared = NativeSkillProjection(aliases, specs, errors, search_agents)
+                    prepared = NativeSkillProjection(
+                        aliases,
+                        specs,
+                        errors,
+                        search_agents,
+                        stems,
+                        identity_cap_reached=dropped_count > 0,
+                    )
                     _remember_view_sources(aliases)
                     prepared._lease_finalizer = weakref.finalize(prepared, lease_stack.close)
                 except BaseException:
