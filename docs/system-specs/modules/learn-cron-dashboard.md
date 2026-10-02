@@ -2834,6 +2834,14 @@ GET `/api/file-office-slides?path=...` is the rendered-slides manifest for a `.p
 
 ### Frontend (React SPA)
 
+Redaction details cards hand keyboard focus from their opener into the card
+after its reveal. The reply's `RedactionProvider` records that opener; a delayed
+handoff runs only while the same card is open and that opener still has focus.
+Moving to another control or a dialog, including the card's own confirmation,
+keeps focus there. Closing or switching cards cancels the pending handoff even
+while an exit animation keeps the old card mounted. Close and Escape still
+return focus to the recorded opener.
+
 In split view the geometric top-left pane stands in for the single-chat title
 row at the surface's top-left: on desktop it clears the shell's sessions-sidebar
 toggle while the sidebar is collapsed, on mobile it renders that toggle inline,
