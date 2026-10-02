@@ -191,7 +191,8 @@ floor and the reserve together. When enabled, the per-spawn guard adds
 `_startup_memory_reserve_gb` to it, so a start is admitted only if
 `available − Σ outstanding start prices − price(this start) ≥ spawn_min_memory_gb`.
 Below that a durable spawn waits in the queue (`low_memory`); a capacity verdict
-never fails it. The governance, cwd and memory-identity checks that run earlier
+never fails it, but the wait is bounded by `agent.subagent_queue_max_wait_secs`
+(§ Durable task queue, "A memory deferral has a max wait"). The governance, cwd and memory-identity checks that run earlier
 in the same gate are refusals and stay refusals.
 
 **Prices.** Decided per start (`_spawn_memory_floor_and_cost` reads the floor and
@@ -348,7 +349,9 @@ It keeps a start (`_memory_pressure_holds`) when, in addition:
   child would hold the parent on an episode only the child can end;
 - it is not a claim re-entry (`_dispatch_now`), which already holds its slot;
 - the start's own wait has not run out. A row's wait is clocked from the first
-  time it is held, and past `_PRESSURE_HOLD_MAX_WAIT_SECS` it never proceeds
+  time it is held, and past `agent.subagent_queue_max_wait_secs` (read live off
+  the manager at each check through `taskq_memory_wait_bound_secs`, the bound
+  the store deferrals use; `0` is no bound) it never proceeds
   into the pressure it waited on: it is ended, never started
   (`MEMORY_PRESSURE_NEVER_STARTED`, which OPENS with its verdict because a
   surface grouping terminal runs would otherwise read it as a success; its row
@@ -370,16 +373,15 @@ It keeps a start (`_memory_pressure_holds`) when, in addition:
   (`_pressure_hold_expired`) whose `expired_by` says which bound ended it:
   `wait` (its own wait ran out) or `episode` (the spent episode ended it at
   once, so `waited_secs` is near 0 and `episode_secs` carries the episode's
-  length). The bound is a named constant carrying the
-  planned default of the queued-spawn maximum wait, a config key main does not
-  have yet. An approval-released start past its bound ends the same way. The
+  length). An approval-released start past its bound ends the same way. The
   pump's pick only classifies an expired row (it is picked); the gate's
   re-check is what ends it and writes the record, so a row whose level eased
   in between starts with no "never started" audit. The clock survives a pause
   in the hold, such as our last runtime ending between two of a wave's
   starts, so a wave released one runtime at a time still meets the bound; only
-  a clock older than `_PRESSURE_HOLD_PRUNE_SECS` (a row that left with no
-  registration or refusal) is dropped.
+  a clock older than `_PRESSURE_HOLD_PRUNE_FACTOR` times the bound (the key's
+  default when the bound is lower or `0`), a row that left with no
+  registration or refusal, is dropped.
 
 **Foreign pressure with a runtime of ours alive, weighed.** The hold cannot
 tell its own load from foreign load (a browser, a build). So with one
@@ -387,16 +389,19 @@ long-lived dedicated subagent of ours running (a `keep` conversation, say) on a
 Mac held at WARN by other apps, every new root start waits, up to its bound,
 even though ending our runtime might not end the episode. That is the chosen
 side: a new runtime under WARN slows the whole machine, not just Kiro Crew, and
-the per-row bound caps the wait at `_PRESSURE_HOLD_MAX_WAIT_SECS` (30 minutes),
+the per-row bound caps the wait at `agent.subagent_queue_max_wait_secs` (30
+minutes by default),
 after which the start is ended rather than launched into the pressure. A
 chronic episode does not make every new start wait that long in turn: once the
-hold has applied without a break for `_PRESSURE_HOLD_MAX_WAIT_SECS`
+hold has applied without a break for the same bound
 (`_pressure_episode_since`, from the first read at which it applied; a read at
 which it does not apply, because the level eased or nothing of ours runs, ends
 the episode, and so does a gap between reads longer than
 `_PRESSURE_EPISODE_MAX_GAP_SECS`, a break nobody observed), the episode is spent (`_pressure_episode_spent`, one WARNING) and
 every start the hold would keep is ended at once, never started, until the hold
-stops applying.
+stops applying. The bound is live here too: a read under a bound the episode no
+longer outlives (one raised past it, or `0`) un-spends it, so new starts are
+held again rather than ended.
 With no runtime of ours the hold never applies, so foreign pressure alone never
 delays or ends a start. `spawn_min_memory_gb = 0` turns it off. The
 shared-to-dedicated top-up is not a held start: it is an admitted run already
@@ -447,8 +452,8 @@ label, detail or event (the figure cleared the floor, so any "N GB free, needs
 M GB" pair would contradict the verdict), and WARNING once per level
 (`_pressure_hold_level`), DEBUG for every later row. When the hold stops
 applying, the WARNING latch resets, so the next episode warns again; each row
-keeps its wait clock (see the bound above) unless it is older than
-`_PRESSURE_HOLD_PRUNE_SECS`.
+keeps its wait clock (see the bound above) unless it is older than the prune
+age (`_PRESSURE_HOLD_PRUNE_FACTOR` times the bound).
 
 An unreadable figure on macOS is reported like Linux's: a WARNING and a
 `memory_check_unavailable` SEL row, and the start proceeds on the fail-open
@@ -2172,6 +2177,56 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   `deferred_low_memory` / `deferred_memory_critical` (store) vs the legacy
   `refused_low_memory` / `refused_memory_critical`. The macOS kernel pressure
   hold is a capacity-style wait (step 5), audited `deferred_memory_pressure`.
+- **A memory deferral has a max wait** (owner decision, RFC Q10):
+  `agent.subagent_queue_max_wait_secs`, default
+  `DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS` (1800 s), `0` for no bound, read live
+  (`LIVE_CONFIG_PATHS`, adopted by `apply_limits`; no restart mark). Each re-park
+  writes `now + admit_wait`, so on its own a deferral renews itself for as long as
+  the host stays short. The pump ends it: at the END of every pass, after that pass
+  has re-checked and re-parked what it picked, `taskq_expire_memory_waits_async`
+  (the inline pump calls `taskq_expire_memory_waits`) reads
+  `TaskStore.deferred_longer_than` -- `queued` rows still parked that have spent
+  the bound PARKED in their current wait (the `deferred` events after the row's
+  last `claimed`/`transition`, each counted from its `ts` to its `until`) -- and
+  fails each one in the same writer-thread call, fenced by the generation it read.
+  A re-check does not restart the clock; a claim does. What is measured is parked
+  time, not time since the first deferral: a row whose deferral merely LAPSED is
+  eligible again and waits for a slot, so it is not ended, and the time it spends
+  that way does not count once it is parked again (a row held back once, then
+  queued for 30 minutes behind a full cap, is not ended by its next memory
+  re-check). The cost is in the other direction: a pass picks one row, so a long
+  backlog of deferred rows is re-checked one stagger apart, and the time a row
+  spends eligible waiting for its re-check is not counted either. Live runs,
+  accepts in flight and rows the pump has popped are excluded. Each failed row is reported
+  through `_report_queued_stop(params, error=QUEUED_WAIT_EXPIRED_TEXT)`: the
+  queued-stop report with `never started: waiting for memory` as its `error`
+  (outcome `failed`), so batch accounting, the digest and a waiting parent's wake
+  are the stop's, and so is the depth: `_report_queued_stop` re-publishes the
+  parent's queued depth itself, once per row and before the terminal record is
+  built (the sweep emits none of its own), which reaches 0 once nothing else
+  waits. The report's own settle then finds the row already
+  `failed`, which `taskq_report_refused_settle` logs at DEBUG rather than as a
+  lost write -- only for a record that never held a claim (`never_claimed`); a
+  claimed run finding its own state already written is still a warning, since
+  that is a newer owner having settled the same row. Rows are bounded alike whether they were accepted by this process
+  or restored from `tasks.db` (the clock is the store's event time). **A parent
+  that ended is not rebuilt:** `snapshot_teardown_children` stamps the parent key
+  (`taskq_mark_parent_retired`, store clock, kept `_RETIRED_PARENT_TTL_SECS`),
+  because a row waiting in the store alone is in no teardown snapshot; an expired
+  row accepted at or before that stamp is added to `_teardown_cancelled_ids`, so
+  its card ends but nothing injects into the retired conversation, while a
+  successor's own rows under the same key report as usual. The stamp is in this
+  process only: after a gateway restart, a store row of a parent torn down
+  before it is reported like any other (the same reach a restored row of a
+  retired parent already has when it starts and completes). Cancelling a retired
+  parent's store rows at teardown is what closes that, and is not done here.
+  The stamp is taken after the teardown's own gates, and only when the manager
+  has an admission coordinator. A spawn with no durable row is refused at the
+  memory floor, so this sweep has no in-memory deferral to bound; the one
+  in-memory memory wait, the macOS kernel memory-pressure hold, reads the same
+  key for its own per-start and per-episode bound (*macOS: the kernel
+  memory-pressure hold*). No separate "still waiting" notice is sent while a row waits: the
+  queued card and `queued_wait_text` say why it waits until the bound ends it.
 - **Nested tree.** `taskq_accept` sets `parent_id` (and inherits `root_id`)
   when the spawning session is `subagent:<id>` and that id has a row, so the
   store holds the S → A → B links a restart rebuilds from.
