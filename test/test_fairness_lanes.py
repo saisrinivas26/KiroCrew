@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from overload_fakes import Clock, ManagerHarness, open_task_store
@@ -321,37 +322,70 @@ async def test_child_reserve_refills_beside_restricted_root_entries(h, mode) -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["persistent", "incognito", "temporary"])
-@pytest.mark.parametrize("pressure", ["absolute", "posture"])
-async def test_pressure_defers_only_a_subagent_with_a_durable_row(h, mode, pressure) -> None:
-    from kiro_crew.resource_status import AdmissionDecision
+async def test_low_memory_queues_every_subagent_and_defers_only_a_durable_row(h, mode) -> None:
+    """A capacity verdict never refuses: the start waits whatever its memory mode.
 
+    A durable row is deferred in the store (``next_run_at``); a row the store
+    must never hold waits in the in-memory window, not eligible again until
+    the same admit wait passes, and starts once the host has room.
+    """
     hz = await h(max_concurrent=1)
-    target = (
-        "kiro_crew.subagent.check_memory_available"
-        if pressure == "absolute"
-        else "kiro_crew.subagent.cached_admission_check"
-    )
-    result = (
-        (False, 0.5)
-        if pressure == "absolute"
-        else AdmissionDecision(admitted=False, posture="critical", available_gb=0.5, reason="low")
-    )
     with (
-        patch(target, return_value=result),
+        patch("kiro_crew.subagent.check_memory_available", return_value=(False, 0.5)),
         patch.object(
             type(hz.mgr._admission), "taskq_defer", wraps=hz.mgr._admission.taskq_defer
         ) as defer,
     ):
         info = hz.spawn("pressure sentinel", _memory_mode=mode)
-    if mode == "persistent":
-        assert info.queued and not info.done
-        assert hz.store.get(info.id).state == model.QUEUED
-        defer.assert_called_once()
-    else:
-        assert info.done and not info.queued and "spawn refused" in info.error
-        defer.assert_not_called()
-        assert hz.store.get(info.id) is None and not hz.store.events(info.id)
-    assert hz.mgr._running_count == 0 and not hz.started
+        await hz.settle()
+        assert info.queued and not info.done and info.error == ""
+        assert info.queued_reason == "low_memory" and "0.5 GB available" in (
+            info.queued_reason_detail
+        )
+        assert hz.mgr._running_count == 0 and not hz.started
+        if mode == "persistent":
+            assert hz.store.get(info.id).state == model.QUEUED
+            defer.assert_called_once()
+        else:
+            defer.assert_not_called()
+            assert hz.store.get(info.id) is None and not hz.store.events(info.id)
+            (entry,) = [p for p in hz.mgr._queue if p["_preassigned_id"] == info.id]
+    if mode != "persistent":
+        key = hz.mgr._admission.MEMORY_WAIT_UNTIL_KEY
+        # The host has room again, but the admit wait has not passed: a pass in
+        # between SKIPS the entry -- it neither starts nor re-reads the host,
+        # which would otherwise happen on every drain while memory stays low.
+        assert entry[key] > time.monotonic()
+        with patch("kiro_crew.subagent.check_memory_available", return_value=(True, 8.0)) as read:
+            hz.mgr._drain_queue()
+            await hz.settle()
+        assert not hz.started and read.call_count == 0
+        assert [p["_preassigned_id"] for p in hz.mgr._queue] == [info.id]
+        # The wait passed: the next pass starts it.
+        entry[key] = 0.0
+        hz.mgr._drain_queue()
+        await hz.settle()
+        assert hz.started == [info.id]
+        assert not hz.mgr._queue
+        await hz.end(hz.live(info))
+
+
+@pytest.mark.asyncio
+async def test_the_pick_never_asks_the_pressure_hold_about_a_floor_wait(h) -> None:
+    """A floor wait past its stamp goes to the gate, which re-checks the floor
+    before the kernel pressure hold. Asking the hold at the pick would start a
+    pressure clock for a start that waits on the floor, and the hold's bound
+    could later end it "never started" for time it never spent on the kernel."""
+    hz = await h(max_concurrent=2)
+    key = hz.mgr._admission.MEMORY_WAIT_UNTIL_KEY
+    held = {"_preassigned_id": "held", "parent_session_key": "dashboard:a", "_lane": "root"}
+    floor = {"_preassigned_id": "floor", "parent_session_key": "dashboard:b", "_lane": "root"}
+    floor[key] = 0.0  # its admit wait has passed
+    hz.mgr._queue[:] = [held, floor]
+    root_held = MagicMock(return_value=True)
+    assert hz.mgr._admission.pick_window_index(root_held=root_held) == 1
+    assert [c.args[0]["_preassigned_id"] for c in root_held.call_args_list] == ["held"]
+    hz.mgr._queue.clear()
 
 
 @pytest.mark.asyncio
