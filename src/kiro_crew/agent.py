@@ -103,7 +103,7 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
     SecurityEvent,
     sel,
 )
-from kiro_crew.user_json import loads_user_json
+from kiro_crew.user_json import load_user_json_object, loads_user_json
 from kiro_crew.validation import is_registered_agent_name
 
 if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
@@ -2072,7 +2072,9 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
             agree; omitted, it is evaluated here.
     """
     config = _load_json(_shipped_defaults())
-    config = _deep_merge(config, _load_json(_user_overrides_path()))
+    # The overrides file is hand-edited, so a leading UTF-8 byte-order mark is
+    # accepted there.
+    config = _deep_merge(config, load_user_json_object(_user_overrides_path()))
 
     # Ensure hooks always come from the bundled config,
     # even if the project-level defaults.json is stale.
@@ -4953,7 +4955,9 @@ def _sanitize_agent_hooks() -> None:
             continue
         if _hooks_sanitized_mtimes.get(str(f)) == mtime:
             continue
-        data = _load_json(f)
+        # Same parse as the spec readers: a hand-saved spec may carry a leading
+        # UTF-8 byte-order mark.
+        data = load_user_json_object(f)
         if not data:
             continue
         hooks = data.get("hooks")
