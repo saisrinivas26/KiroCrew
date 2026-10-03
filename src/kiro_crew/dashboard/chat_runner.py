@@ -210,6 +210,7 @@ from kiro_crew.dashboard.chat_turn.recipient import (  # noqa: F401
     cross_surface_withheld,
 )
 from kiro_crew.dashboard.chat_turn.recovery import (  # noqa: F401
+    _REPLAY_GUARD_FIELDS,
     _answer_text_only,
     _current_turn_carries_image_ref,
     _drop_superseded_image_recovery,
@@ -226,6 +227,7 @@ from kiro_crew.dashboard.chat_turn.recovery import (  # noqa: F401
     _recovery_delay,
     _refresh_genuine_turn_allowances,
     _refusal_replay_vetoed_at_consume,
+    _replay_revoked,
     _requeue_after_prompt_busy,
     _requeue_auth_retry,
     _retry_cancel_reason,
@@ -6183,26 +6185,8 @@ TURN_ACTOR_META_KEY = _TURN_ACTOR_META_KEY
 
 
 def _session_not_found_replay_revoked(state: Any, slot: Any) -> tuple[bool, bool, bool]:
-    """Whether the queued lost-session replay was revoked since it was enqueued.
-
-    Returns ``(stopped, superseded, rebound)``: a Stop on the slot or its session
-    counted since the enqueue, a user follow-up or steer queued behind it, or the
-    slot bound to a different session than the one the replay belongs to.
-    """
-    bound_key = getattr(slot, "_session_not_found_session_key", "")
-    live_key = effective_session_key(slot)
-    rebound = bool(bound_key) and live_key != bound_key
-    cur_stop_gen = getattr(slot, "_stop_generation", 0)
-    cur_session_stop_gen = _session_stop_generation_for(
-        getattr(state, "sessions", None), bound_key or live_key
-    )
-    stopped = cur_stop_gen != getattr(
-        slot, "_session_not_found_stop_gen", cur_stop_gen
-    ) or cur_session_stop_gen != getattr(
-        slot, "_session_not_found_session_stop_gen", cur_session_stop_gen
-    )
-    superseded = bool(getattr(slot, "_pending_steers", None)) or _has_user_queued_followup(slot)
-    return stopped, superseded, rebound
+    """Whether the queued lost-session replay was revoked since it was enqueued."""
+    return _replay_revoked(state, slot, "session_not_found")
 
 
 def _clear_session_not_found_replay(slot: Any) -> None:

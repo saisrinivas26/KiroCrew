@@ -288,6 +288,57 @@ def _session_stop_generation_for(sessions: Any, session_key: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+#: Where each head-of-queue recovery keeps its replay guard: the slot Stop count,
+#: the session Stop count and the session binding it was enqueued under. One
+#: record shape for every family, read by one revocation check.
+_REPLAY_GUARD_FIELDS: dict[str, tuple[str, str, str]] = {
+    "refusal": (
+        "_refusal_replay_stop_gen",
+        "_refusal_replay_session_stop_gen",
+        "_refusal_fallback_session_key",
+    ),
+    "model_access": (
+        "_model_access_recovery_stop_gen",
+        "_model_access_recovery_session_stop_gen",
+        "_model_access_recovery_session_key",
+    ),
+    "image": (
+        "_image_recovery_stop_gen",
+        "_image_recovery_session_stop_gen",
+        "_image_recovery_session_key",
+    ),
+    "session_not_found": (
+        "_session_not_found_stop_gen",
+        "_session_not_found_session_stop_gen",
+        "_session_not_found_session_key",
+    ),
+}
+
+
+def _replay_revoked(state: Any, slot: Any, family: str) -> tuple[bool, bool, bool]:
+    """Whether *family*'s queued replay was revoked since it was enqueued.
+
+    Returns ``(stopped, superseded, rebound)``: a Stop counted on the slot or on
+    the replay's session since the enqueue, a user steer or follow-up queued
+    behind it, or the slot bound to another session than the one recorded. The
+    session Stop count is read for the RECORDED binding when there is one,
+    because that is the session whose Stop supersedes the replay.
+    """
+    stop_field, session_stop_field, key_field = _REPLAY_GUARD_FIELDS[family]
+    bound_key = getattr(slot, key_field, "")
+    live_key = effective_session_key(slot)
+    rebound = bool(bound_key) and live_key != bound_key
+    cur_stop_gen = getattr(slot, "_stop_generation", 0)
+    cur_session_stop_gen = _session_stop_generation_for(
+        getattr(state, "sessions", None), bound_key or live_key
+    )
+    stopped = cur_stop_gen != getattr(slot, stop_field, cur_stop_gen) or (
+        cur_session_stop_gen != getattr(slot, session_stop_field, cur_session_stop_gen)
+    )
+    superseded = bool(getattr(slot, "_pending_steers", None)) or _has_user_queued_followup(slot)
+    return stopped, superseded, rebound
+
+
 def _retry_cancel_reason(rebound: bool, superseded: bool, stopped: bool) -> str:
     """The tail of a "retry cancelled" notice, naming why the retry was dropped.
 
@@ -311,20 +362,8 @@ async def _image_recovery_vetoed_at_consume(state: DashboardState, slot: _ChatSl
     way the recorded replay identity is consumed, so it runs once per dispatch; a veto
     also refunds the shared discard one-shot (``_poisoned_reset_used``).
     """
-    _img_recorded_key = getattr(slot, "_image_recovery_session_key", "")
-    _img_live_key = effective_session_key(slot)
-    _img_rebound_consume = bool(_img_recorded_key) and _img_live_key != _img_recorded_key
-    _img_cur_stop_gen = getattr(slot, "_stop_generation", 0)
-    _img_session_stop_gen = _session_stop_generation_for(
-        getattr(state, "sessions", None), _img_recorded_key or _img_live_key
-    )
-    _img_stopped_consume = _img_cur_stop_gen != getattr(
-        slot, "_image_recovery_stop_gen", _img_cur_stop_gen
-    ) or _img_session_stop_gen != getattr(
-        slot, "_image_recovery_session_stop_gen", _img_session_stop_gen
-    )
-    _img_superseded_consume = bool(getattr(slot, "_pending_steers", None)) or (
-        _has_user_queued_followup(slot)
+    _img_stopped_consume, _img_superseded_consume, _img_rebound_consume = _replay_revoked(
+        state, slot, "image"
     )
     if (
         _img_rebound_consume
@@ -410,18 +449,8 @@ async def _model_access_replay_vetoed_at_consume(state: DashboardState, slot: _C
     """
     _ma_recorded_key = getattr(slot, "_model_access_recovery_session_key", "")
     _ma_live_key = effective_session_key(slot)
-    _ma_rebound_consume = bool(_ma_recorded_key) and _ma_live_key != _ma_recorded_key
-    _ma_cur_stop_gen = getattr(slot, "_stop_generation", 0)
-    _ma_session_stop_gen = _session_stop_generation_for(
-        getattr(state, "sessions", None), _ma_recorded_key or _ma_live_key
-    )
-    _ma_stopped_consume = _ma_cur_stop_gen != getattr(
-        slot, "_model_access_recovery_stop_gen", _ma_cur_stop_gen
-    ) or _ma_session_stop_gen != getattr(
-        slot, "_model_access_recovery_session_stop_gen", _ma_session_stop_gen
-    )
-    _ma_superseded_consume = bool(getattr(slot, "_pending_steers", None)) or (
-        _has_user_queued_followup(slot)
+    _ma_stopped_consume, _ma_superseded_consume, _ma_rebound_consume = _replay_revoked(
+        state, slot, "model_access"
     )
     if (
         _ma_rebound_consume
@@ -474,21 +503,7 @@ async def _refusal_replay_vetoed_at_consume(state: DashboardState, slot: _ChatSl
     seam. True means the replay was cancelled and the turn returns; the allowance
     stays spent. A replay that may run keeps its record for ``_rearm_turn_episode``.
     """
-    _rv_recorded_key = getattr(slot, "_refusal_fallback_session_key", "")
-    _rv_live_key = effective_session_key(slot)
-    _rv_rebound = bool(_rv_recorded_key) and _rv_live_key != _rv_recorded_key
-    _rv_cur_stop_gen = getattr(slot, "_stop_generation", 0)
-    _rv_session_stop_gen = _session_stop_generation_for(
-        getattr(state, "sessions", None), _rv_recorded_key or _rv_live_key
-    )
-    _rv_stopped = _rv_cur_stop_gen != getattr(
-        slot, "_refusal_replay_stop_gen", _rv_cur_stop_gen
-    ) or _rv_session_stop_gen != getattr(
-        slot, "_refusal_replay_session_stop_gen", _rv_session_stop_gen
-    )
-    _rv_superseded = bool(getattr(slot, "_pending_steers", None)) or (
-        _has_user_queued_followup(slot)
-    )
+    _rv_stopped, _rv_superseded, _rv_rebound = _replay_revoked(state, slot, "refusal")
     if (
         _rv_rebound
         or _rv_stopped
@@ -662,20 +677,7 @@ async def _drop_superseded_model_access_replay(state: DashboardState, slot: _Cha
     queue emptied and the drain has nothing to start.
     """
     if slot._model_access_recovery_pending:
-        _ma_user_input = bool(getattr(slot, "_pending_steers", None)) or _has_user_queued_followup(
-            slot
-        )
-        _ma_cur_gen = getattr(slot, "_stop_generation", 0)
-        _ma_cur_session_gen = _session_stop_generation_for(
-            getattr(state, "sessions", None), effective_session_key(slot)
-        )
-        _ma_stopped = _ma_cur_gen != getattr(
-            slot, "_model_access_recovery_stop_gen", _ma_cur_gen
-        ) or _ma_cur_session_gen != getattr(
-            slot, "_model_access_recovery_session_stop_gen", _ma_cur_session_gen
-        )
-        _ma_bound_key = getattr(slot, "_model_access_recovery_session_key", "")
-        _ma_rebound = bool(_ma_bound_key) and effective_session_key(slot) != _ma_bound_key
+        _ma_stopped, _ma_user_input, _ma_rebound = _replay_revoked(state, slot, "model_access")
         if (
             _should_suppress_requeue(slot)
             or slot._stopping
@@ -734,21 +736,7 @@ async def _drop_superseded_image_recovery(state: DashboardState, slot: _ChatSlot
             slot._image_recovery_queue_id = ""
             slot._image_recovery_session_key = ""
         else:
-            _img_cur_stop_gen = getattr(slot, "_stop_generation", 0)
-            _img_bound_key = getattr(slot, "_image_recovery_session_key", "")
-            _img_cur_key = effective_session_key(slot)
-            _img_rebound = bool(_img_bound_key) and _img_cur_key != _img_bound_key
-            _img_cur_session_stop_gen = _session_stop_generation_for(
-                getattr(state, "sessions", None), _img_bound_key or _img_cur_key
-            )
-            _img_stopped = _img_cur_stop_gen != getattr(
-                slot, "_image_recovery_stop_gen", _img_cur_stop_gen
-            ) or _img_cur_session_stop_gen != getattr(
-                slot, "_image_recovery_session_stop_gen", _img_cur_session_stop_gen
-            )
-            _img_superseded = bool(getattr(slot, "_pending_steers", None)) or (
-                _has_user_queued_followup(slot)
-            )
+            _img_stopped, _img_superseded, _img_rebound = _replay_revoked(state, slot, "image")
             if (
                 _should_suppress_requeue(slot)
                 or slot._stopping
@@ -810,26 +798,10 @@ async def _drop_superseded_refusal_replay(state: DashboardState, slot: _ChatSlot
             slot._refusal_replay_queue_id = ""
             slot._refusal_retry_text = ""
         else:
-            _cur_stop_gen = getattr(slot, "_stop_generation", 0)
-            # The binding the replay's swap ran under. A live binding that
-            # differs means the slot was bound mid-episode (cron result on an
-            # unbound slot): the replay belongs to the OLD session and must
-            # not dispatch onto the newly bound one. Stop-generation
-            # comparison also keys off the recorded binding — the replay's
-            # session is the one whose Stop supersedes it.
-            _replay_bound_key = getattr(slot, "_refusal_fallback_session_key", "")
-            _cur_key = effective_session_key(slot)
-            _replay_rebound = bool(_replay_bound_key) and _cur_key != _replay_bound_key
-            _cur_session_stop_gen = _session_stop_generation_for(
-                getattr(state, "sessions", None), _replay_bound_key or _cur_key
-            )
-            _replay_stopped = _cur_stop_gen != getattr(
-                slot, "_refusal_replay_stop_gen", _cur_stop_gen
-            ) or _cur_session_stop_gen != getattr(
-                slot, "_refusal_replay_session_stop_gen", _cur_session_stop_gen
-            )
-            _replay_superseded = bool(getattr(slot, "_pending_steers", None)) or (
-                _has_user_queued_followup(slot)
+            # The replay belongs to the binding its swap ran under: a rebind,
+            # or a Stop on that session, supersedes it.
+            _replay_stopped, _replay_superseded, _replay_rebound = _replay_revoked(
+                state, slot, "refusal"
             )
             if (
                 _should_suppress_requeue(slot)
