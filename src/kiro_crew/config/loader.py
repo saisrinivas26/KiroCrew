@@ -5785,6 +5785,8 @@ def reset_dangling_default_agent() -> bool:
     template = _dangling_template(row.kiro_agent, names)
     if template is None or template not in removed or template in _edition_agent_names():
         return False
+    if _workspace_declares(cfg, row, template):
+        return False
     reset = False
 
     def _reset(data: dict) -> dict | None:
@@ -5823,6 +5825,33 @@ def reset_dangling_default_agent() -> bool:
     )
     _log_default_agent_reset(current, template)
     return True
+
+
+def _workspace_declares(cfg: KiroCrewConfig, row: KiroCrewAgentConfig, template: str) -> bool:
+    """Whether the alias's workspace checkout still declares *template*.
+
+    The removal evidence comes from the user-level agents directory only, but
+    kiro-cli resolves ``--agent`` against the session's project directory first,
+    so a global spec uninstalled while the alias's workspace checkout declares a
+    same-named spec leaves the default dispatching there. The workspace is the
+    one the alias binds (falling back to ``default_workspace``, as dispatch
+    does), listed with the same discovery the agent picker uses. A listing that
+    fails answers ``True``: the healer does not act on what it cannot check.
+    """
+    workspace = cfg.workspaces.get(row.workspace) or cfg.workspaces.get(cfg.default_workspace)
+    if workspace is None or not workspace.dir:
+        return False
+    # Deferred: agent_discovery imports this package's paths at load time.
+    from kiro_crew.agent_discovery import list_agents
+
+    try:
+        agents = list_agents(
+            agents_dir=kiro_agents_dir(), project_dir=Path(workspace.dir).expanduser()
+        )
+    except Exception:  # noqa: BLE001 — an unreadable checkout is not evidence of removal
+        logger.debug("default agent check: workspace agents unreadable", exc_info=True)
+        return True
+    return any(agent.name == template for agent in agents)
 
 
 def _edition_agent_names() -> frozenset[str]:
