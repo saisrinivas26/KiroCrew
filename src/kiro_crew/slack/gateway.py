@@ -125,7 +125,12 @@ from kiro_crew.cron import (  # noqa: F401
     build_cron_session_context,
     effective_wake_budget,
 )
-from kiro_crew.cron_script import delivery_fingerprint, run_command_sandboxed, run_script_sandboxed
+from kiro_crew.cron_script import (
+    cron_owner_app,
+    delivery_fingerprint,
+    run_command_sandboxed,
+    run_script_sandboxed,
+)
 from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import (
@@ -3768,6 +3773,7 @@ class GatewayOrchestrator:
                         job.id,
                         job.secret_env,
                         job.secret_env_pin,
+                        cron_owner_app(job.created_by),
                         timeout=_claim_backstop(job, cmd_timeout),
                     )
                     if result.get("status") == "cancelled":
@@ -4146,6 +4152,7 @@ class GatewayOrchestrator:
                             job.thread_ts or "",
                         ),
                         self._live_internal_secret,
+                        cron_owner_app(job.created_by),
                         timeout=_claim_backstop(job, script_timeout),
                     )
                     status = result.get("status", "error")
