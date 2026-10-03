@@ -3936,6 +3936,7 @@ class SubagentManager:
             self._taskq_unavailable = None
             self._taskq_reopen_attempts = 0
             if self._reaper_task is not None and not self._reaper_task.done():
+                self._admission.taskq_schedule_owed_replay()
                 self._drain_queue()
 
     async def wait_taskq_ready(self) -> None:
@@ -6514,7 +6515,7 @@ class SubagentManager:
     def _unqueue(self, agent_id: str, **kwargs: Any) -> dict | None:
         return self._cancellation._unqueue_impl(agent_id, **kwargs)
 
-    def _report_queued_stop(self, params: dict, *, error: str = "") -> None:
+    def _report_queued_stop(self, params: dict, *, error: str = "") -> "asyncio.Task[bool] | None":
         return self._cancellation._report_queued_stop_impl(params, error=error)
 
     async def cancel(self, agent_id: str) -> bool:
