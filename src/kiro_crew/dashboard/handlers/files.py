@@ -103,6 +103,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import (
     BINARY_MIME_ALLOWLIST,
+    contains_sensitive_resolved_path,
     is_sensitive_path,
     is_sensitive_resolved_path,
     redact_credentials,
@@ -8496,13 +8497,40 @@ def _project_tree_entries(
     *dirpath*, ancestors above the project root included, so a project rooted
     inside one (``~/.config``) is fenced too. Runs on the walk's worker thread,
     so the pre-resolved gate answers inline.
+
+    What the gate costs is paid per CALL: it resolves its own anchors --
+    ``$HOME``, the override roots, the keystone leaves -- every time, then
+    compares the candidate against every resolved target. A call per entry
+    therefore pays both of those per entry, and under a dot-named root
+    ``under_dot`` holds for every directory, so every entry in the project is a
+    candidate. Most of them are settled by two questions about the DIRECTORY,
+    asked once: whether it is itself inside a store, and whether a store lies
+    beneath it. When neither holds, no name directly in it can spell a fenced
+    path, because the real path of an entry that is not a link is this
+    directory's own real path plus that name. That settles the publish-artifact
+    clause with it: a directory holding a keystone leaf holds a sensitive target
+    as well, so it is never one of these. When either holds, the directory's
+    entries are asked about one at a time.
+
+    An entry that is a LINK is asked about either way, since its real path is
+    somewhere else entirely and neither directory-level answer binds it.
     """
-    under_dot = any(part.startswith(".") for part in PurePath(os.path.realpath(dirpath)).parts)
+    real_dirpath = os.path.realpath(dirpath)
+    under_dot = any(part.startswith(".") for part in PurePath(real_dirpath).parts)
+    # Decided once for the whole directory: whether any entry of it still has to
+    # be asked about on its own. Both calls compare lists against the resolved
+    # targets and walk nothing.
+    ask_per_entry = is_sensitive_resolved_path(real_dirpath) or contains_sensitive_resolved_path(
+        real_dirpath
+    )
 
     def fenced(name: str) -> bool:
         if not (under_dot or name.startswith(".")):
             return False
-        return is_sensitive_resolved_path(os.path.realpath(os.path.join(dirpath, name)))
+        full = os.path.join(dirpath, name)
+        if not ask_per_entry and not platform_compat.is_link_or_junction(full):
+            return False
+        return is_sensitive_resolved_path(os.path.realpath(full))
 
     dirs = sorted(d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not fenced(d))
     return dirs, [f for f in filenames if not fenced(f)]

@@ -3546,7 +3546,9 @@ def sensitive_path_refusal(path_str: str, base_dir: str | None = None) -> str | 
     return None
 
 
-def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
+def path_contains_sensitive(
+    dir_str: str, base_dir: str | None = None, *, pre_resolved: bool = False
+) -> bool:
     """Return True if a read+write-sensitive location lies UNDER *dir_str*.
 
     The REVERSE direction of :func:`is_sensitive_path`: that gate answers "is
@@ -3564,12 +3566,18 @@ def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
     *dir_str* is a huge tree. Shares :func:`_candidate_forms` and
     :func:`_home_dir_targets` with :func:`_path_in_home_dirs` so the
     symlink/casefold hardening cannot drift between the two directions.
+
+    ``pre_resolved`` is :func:`_candidate_forms`'s flag of the same name, and
+    such a caller is by contract on its own worker thread, so the anchors are
+    resolved inline as well -- the same pairing :func:`_path_in_home_dirs`
+    makes. :func:`contains_sensitive_resolved_path` is the entry point that
+    claims it; see there for why a caller may.
     """
     if not dir_str:
         return False
     try:
-        sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS)
-        candidates = _candidate_forms(dir_str, base_dir)
+        sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS, inline=pre_resolved)
+        candidates = _candidate_forms(dir_str, base_dir, pre_resolved=pre_resolved)
     except PathResolutionStalled:
         return True  # fail closed: see _path_in_home_dirs
     for cand in candidates:
@@ -3586,6 +3594,28 @@ def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
             if target == cand_cf or target.startswith(prefix):
                 return True
     return False
+
+
+def contains_sensitive_resolved_path(resolved_dir: str) -> bool:
+    """:func:`path_contains_sensitive` for a directory the caller has ALREADY canonicalised.
+
+    Stands to :func:`path_contains_sensitive` exactly as
+    :func:`is_sensitive_resolved_path` stands to :func:`is_sensitive_path`: same
+    decision, same targets, and no ``mc-pathres`` submission on either half --
+    the directory is matched lexically and the anchors resolve inline on the
+    calling thread, fresh on every call. The contract is that one's too, and for
+    the same reason: *resolved_dir* MUST be the ``os.path.realpath`` the caller
+    computed on its OWN worker thread, and calling this from the event loop
+    forfeits the bound the pool exists to give that loop.
+
+    The caller it exists for is a bulk WALK that has resolved a directory and
+    wants to know whether anything below it is fenced BEFORE asking about each
+    of its entries one at a time. That is a question about the directory, so it
+    is asked once per directory; asking it through the bounded gate would put a
+    pool hop on a worker thread that gains nothing from one, while its
+    submissions queue ahead of the loop's own.
+    """
+    return path_contains_sensitive(resolved_dir, pre_resolved=True)
 
 
 def is_sensitive_write_path(path_str: str, base_dir: str | None = None) -> bool:
